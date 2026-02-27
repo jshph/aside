@@ -1,0 +1,10 @@
+[package]
+name = "notes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }

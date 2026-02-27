@@ -1,0 +1,15 @@
+[package]
+name = "record"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.17"
+dasp = "0.11"
+hound = "3.5"
+ctrlc = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cidre = { version = "0.14", features = ["av"] }

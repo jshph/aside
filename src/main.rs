@@ -15,7 +15,7 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(name = "aside", about = "Record and take timestamped notes in one session")]
 struct Args {
-    /// Session name (creates <name>.md and recordings/<name>_seg0.wav)
+    /// Session name (creates <name>.md and .aside/<name>_seg0.wav)
     name: Option<String>,
 
     /// Resume an existing session
@@ -34,15 +34,6 @@ fn main() -> Result<()> {
         return cmd_list();
     }
 
-    // Check audio capture permission before starting any recording session
-    #[cfg(target_os = "macos")]
-    if !recorder::ensure_audio_capture_permission() {
-        eprintln!("Warning: Screen & System Audio Recording permission not granted.");
-        eprintln!("System audio capture will be silent. Grant permission in:");
-        eprintln!("  System Settings → Privacy & Security → Screen & System Audio Recording");
-        eprintln!("Then restart aside.");
-    }
-
     if let Some(name) = args.resume {
         return cmd_resume(&name);
     }
@@ -58,21 +49,21 @@ fn main() -> Result<()> {
     std::process::exit(1);
 }
 
-fn recordings_dir() -> PathBuf {
-    PathBuf::from("recordings")
+fn aside_dir() -> PathBuf {
+    PathBuf::from(".aside")
 }
 
 fn db_path() -> PathBuf {
-    recordings_dir().join(".aside.db")
+    aside_dir().join(".aside.db")
 }
 
-fn ensure_recordings_dir() -> Result<()> {
-    std::fs::create_dir_all(recordings_dir()).context("failed to create recordings/ directory")?;
+fn ensure_aside_dir() -> Result<()> {
+    std::fs::create_dir_all(aside_dir()).context("failed to create .aside/ directory")?;
     Ok(())
 }
 
 fn cmd_new(name: &str) -> Result<()> {
-    ensure_recordings_dir()?;
+    ensure_aside_dir()?;
 
     let conn = session::open_db(&db_path())?;
 
@@ -99,7 +90,7 @@ fn cmd_new(name: &str) -> Result<()> {
     session::create_session(&conn, name, &start_time, &notes_path)?;
 
     let segment_index = 0i64;
-    let wav_path = format!("recordings/{}_seg{}.wav", name, segment_index);
+    let wav_path = format!(".aside/{}_seg{}.wav", name, segment_index);
     let offset_ms = 0i64;
 
     session::add_segment(&conn, name, segment_index, &wav_path, offset_ms, None)?;
@@ -112,7 +103,7 @@ fn cmd_new(name: &str) -> Result<()> {
 }
 
 fn cmd_resume(name: &str) -> Result<()> {
-    ensure_recordings_dir()?;
+    ensure_aside_dir()?;
 
     let conn = session::open_db(&db_path())?;
 
@@ -138,7 +129,7 @@ fn cmd_resume(name: &str) -> Result<()> {
     let parsed = parser::parse_markdown(&content, &start_time);
 
     let segment_index = session::next_segment_index(&conn, name)?;
-    let wav_path = format!("recordings/{}_seg{}.wav", name, segment_index);
+    let wav_path = format!(".aside/{}_seg{}.wav", name, segment_index);
 
     let offset_ms = (Local::now() - start_time).num_milliseconds();
     session::add_segment(&conn, name, segment_index, &wav_path, offset_ms, None)?;
@@ -243,7 +234,7 @@ fn run_with_recorder(
                 // Create a new segment
                 segment_index = session::next_segment_index(conn, session_name)?;
                 current_wav =
-                    format!("recordings/{}_seg{}.wav", session_name, segment_index);
+                    format!(".aside/{}_seg{}.wav", session_name, segment_index);
                 let offset_ms = (Local::now() - app.start_time).num_milliseconds();
                 session::add_segment(
                     conn,

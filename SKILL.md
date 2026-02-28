@@ -10,6 +10,8 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion, mcp__enzyme
 
 Take an aside session end-to-end: transcribe audio, align the transcript with the user's real-time memo, distill into a structured vault note connected to existing thinking via Enzyme.
 
+**Environment**: `$OBSIDIAN_VAULT` refers to the Obsidian vault root (the additional working directory configured for this project).
+
 ## What this produces
 
 1. **Aligned timeline** (`.aside/<session>_aligned.md`) — interleaved transcript + memo on a shared timeline
@@ -25,7 +27,7 @@ If `--align-only` is passed, only the aligned timeline (step 1) is produced.
   - Memo: `<session-name>.md` (in the aside working directory)
   - Audio: `.aside/<session-name>_seg*.wav`
   - DB: `.aside/.aside.db` (for segment offsets and durations)
-- **--template** (optional): Template name for the vault note (default: `1on1-idea-exchange`). Templates live in `/Users/joshuapham/obsidian/.claude/commands/transcript/templates/`.
+- **--template** (optional): Template name for the vault note (default: `1on1-idea-exchange`). Templates live in `$OBSIDIAN_VAULT/.claude/commands/transcript/templates/`.
 - **--prep** (optional): Path to prep notes file for additional context during distillation.
 - **--transcript** (optional): Path to an existing transcript file. If omitted, transcribes the WAV segments using aside.py.
 - **--align-only** (optional): Stop after producing the aligned timeline. Skip distillation.
@@ -69,7 +71,7 @@ $ARGUMENTS = "standup --prep inbox/standup-prep.md"
    ```
    [00:05] discussing API redesign
    [01:30 ~02:15] revisited auth approach — decided on JWT
-   [05:00] action item: Josh to draft RFC by Friday
+   [05:00] action item: draft RFC by Friday
    ```
 2. Query the session database for segment info:
    ```bash
@@ -92,7 +94,7 @@ Read the transcript file. Supported formats:
 
 For each WAV segment:
 ```bash
-python3 ~/Hacks/aside/aside.py ".aside/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
+python3 aside.py ".aside/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
 ```
 
 When there are multiple segments (from device switches), adjust transcript timestamps by each segment's `offset_ms` from the database so they align to the session's global timeline.
@@ -113,7 +115,7 @@ Parse timestamps using the `[MM:SS]` or `[HH:MM:SS]` format. Lines with `~` have
 { type: "transcript", time_s: <start_ms / 1000>, end_s: <end_ms / 1000>, channel: 0|1, text: "..." }
 ```
 
-Channel 0 = mic (the user), Channel 1 = system audio (the other person/people).
+Channel 0 = mic (the local user), Channel 1 = system audio (the remote participant(s)).
 
 **Multi-segment alignment**: For segments beyond seg0, add `offset_ms / 1000` to all transcript timestamps from that segment to place them on the session's global timeline.
 
@@ -159,7 +161,7 @@ Sort all events by timestamp. Write a markdown document with this structure:
 
 > [transcript ch1] Sounds good, I'll review it Monday.
 
-**[05:00 memo]** action item: Josh to draft RFC by Friday
+**[05:00 memo]** action item: draft RFC by Friday
 
 ---
 
@@ -176,7 +178,7 @@ Sort all events by timestamp. Write a markdown document with this structure:
 
 **Formatting rules:**
 - Group into time windows (30s–60s chunks, or natural breaks in conversation)
-- Transcript lines are blockquotes with channel labels: `> [transcript ch0]` for the user, `> [transcript ch1]` for the other side
+- Transcript lines are blockquotes with channel labels: `> [transcript ch0]` for the local user, `> [transcript ch1]` for the remote side
 - Memo lines are bold with their timestamp: `**[MM:SS memo]** text`
 - Edited memo lines get an italic annotation: `*[edited at MM:SS]*`
 - If a memo line falls within a transcript window, place it after the transcript lines it corresponds to
@@ -198,7 +200,7 @@ The memo is the user's real-time attention signal — what they found important 
 
 1. **Extract topics from memo lines first.** Each memo line marks a moment the user chose to note. Classify each line:
    - **Decision** — a choice was made ("decided on JWT")
-   - **Action item** — a commitment or next step ("Josh to draft RFC by Friday")
+   - **Action item** — a commitment or next step ("draft RFC by Friday")
    - **Insight** — a realization or interesting framing ("the real bottleneck is onboarding, not retention")
    - **Tension** — a disagreement or unresolved question ("revisited auth approach")
    - **Question** — something to follow up on
@@ -225,9 +227,9 @@ Run `mcp__enzyme__start_exploring_vault` first. This returns the **slate** — t
 Use **two search strategies**:
 
 **Structured search (Grep)** — for concrete anchors that exist verbatim in the vault:
-- People mentioned: `[[John Borthwick]]`, `[[Chris Perry]]`
+- People mentioned: `[[Person Name]]`
 - Tags from the slate that match transcript topics: `#pkm`, `#ai-ux`
-- Companies or proper nouns: "Betaworks", "Readwise"
+- Companies or proper nouns mentioned in the conversation
 - Wikilinks or note titles
 
 Run Grep for each concrete anchor. Prioritize anchors that appear near memo-marked topics.
@@ -259,7 +261,7 @@ After both structured and semantic results come back:
 
 ### Step 7: Template + draft
 
-1. **Load template** from `/Users/joshuapham/obsidian/.claude/commands/transcript/templates/`. Available templates:
+1. **Load template** from `$OBSIDIAN_VAULT/.claude/commands/transcript/templates/`. Available templates:
    - `1on1-idea-exchange` (default) — for idea-rich 1:1 conversations
    - `discovery-call` — for client/prospect calls
    - `group-conversation` — for multi-person discussions
@@ -304,7 +306,7 @@ Apply revisions if requested. Iterate until the user is satisfied.
 
 Once approved:
 
-1. Create the note via `./scripts/new-note.sh` (run from `/Users/joshuapham/obsidian/`)
+1. Create the note via `./scripts/new-note.sh` (run from `$OBSIDIAN_VAULT/`)
 2. Populate with the approved content using the Edit tool
 3. Rename with a descriptive suffix following vault naming conventions:
    - Keep timestamp prefix
@@ -312,7 +314,7 @@ Once approved:
    - Pattern for conversations: `[timestamp] chat with [person] about [topic].md`
 
 ```bash
-mv "/Users/joshuapham/obsidian/inbox/[timestamp].md" "/Users/joshuapham/obsidian/inbox/[timestamp] [descriptive name].md"
+mv "$OBSIDIAN_VAULT/inbox/[timestamp].md" "$OBSIDIAN_VAULT/inbox/[timestamp] [descriptive name].md"
 ```
 
 ---

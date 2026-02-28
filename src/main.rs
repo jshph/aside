@@ -53,10 +53,6 @@ fn aside_dir() -> PathBuf {
     PathBuf::from(".aside")
 }
 
-fn db_path() -> PathBuf {
-    aside_dir().join(".aside.db")
-}
-
 fn ensure_aside_dir() -> Result<()> {
     std::fs::create_dir_all(aside_dir()).context("failed to create .aside/ directory")?;
     Ok(())
@@ -65,9 +61,9 @@ fn ensure_aside_dir() -> Result<()> {
 fn cmd_new(name: &str) -> Result<()> {
     ensure_aside_dir()?;
 
-    let conn = session::open_db(&db_path())?;
+    let dir = aside_dir();
 
-    if session::session_exists(&conn, name)? {
+    if session::session_exists(&dir, name)? {
         bail!(
             "Session '{}' already exists. Use --resume {} to continue it.",
             name,
@@ -87,35 +83,35 @@ fn cmd_new(name: &str) -> Result<()> {
 
     let start_time = Local::now();
 
-    session::create_session(&conn, name, &start_time, &notes_path)?;
+    session::create_session(&dir, name, &start_time, &notes_path)?;
 
     let segment_index = 0i64;
     let wav_path = format!(".aside/{}_seg{}.wav", name, segment_index);
     let offset_ms = 0i64;
 
-    session::add_segment(&conn, name, segment_index, &wav_path, offset_ms, None)?;
+    session::add_segment(&dir, name, segment_index, &wav_path, offset_ms, None)?;
 
     eprintln!("New session: {}", name);
     eprintln!("  Notes: {}", notes_path);
     eprintln!("  Audio: {}", wav_path);
 
-    run_session(name, &notes_path, &wav_path, start_time, segment_index, &conn)
+    run_session(name, &notes_path, &wav_path, start_time, segment_index)
 }
 
 fn cmd_resume(name: &str) -> Result<()> {
     ensure_aside_dir()?;
 
-    let conn = session::open_db(&db_path())?;
+    let dir = aside_dir();
 
-    if !session::session_exists(&conn, name)? {
+    if !session::session_exists(&dir, name)? {
         bail!(
-            "Session '{}' not found in database. Use `aside {}` to start a new session.",
+            "Session '{}' not found. Use `aside {}` to start a new session.",
             name,
             name
         );
     }
 
-    let start_time = session::get_session_start_time(&conn, name)?;
+    let start_time = session::get_session_start_time(&dir, name)?;
     let notes_path = format!("{}.md", name);
 
     if !std::path::Path::new(&notes_path).exists() {
@@ -128,11 +124,11 @@ fn cmd_resume(name: &str) -> Result<()> {
     let content = std::fs::read_to_string(&notes_path).context("failed to read notes file")?;
     let parsed = parser::parse_markdown(&content, &start_time);
 
-    let segment_index = session::next_segment_index(&conn, name)?;
+    let segment_index = session::next_segment_index(&dir, name)?;
     let wav_path = format!(".aside/{}_seg{}.wav", name, segment_index);
 
     let offset_ms = (Local::now() - start_time).num_milliseconds();
-    session::add_segment(&conn, name, segment_index, &wav_path, offset_ms, None)?;
+    session::add_segment(&dir, name, segment_index, &wav_path, offset_ms, None)?;
 
     eprintln!("Resuming session: {}", name);
     eprintln!("  Notes: {} ({} lines loaded)", notes_path, parsed.len());
@@ -145,18 +141,17 @@ fn cmd_resume(name: &str) -> Result<()> {
     let mic_name = recorder::default_input_device_name().unwrap_or_else(|| "Unknown".into());
     let mut app = app::App::from_parsed(parsed, notes_path, start_time, mic_name);
 
-    run_with_recorder(&mut app, &wav_path, name, segment_index, None, &conn)
+    run_with_recorder(&mut app, &wav_path, name, segment_index, None)
 }
 
 fn cmd_list() -> Result<()> {
-    let db = db_path();
-    if !db.exists() {
-        eprintln!("No sessions found (no database at {:?}).", db);
+    let dir = aside_dir();
+    if !dir.exists() {
+        eprintln!("No sessions found (no .aside/ directory).");
         return Ok(());
     }
 
-    let conn = session::open_db(&db)?;
-    let sessions = session::list_sessions(&conn)?;
+    let sessions = session::list_sessions(&dir)?;
 
     if sessions.is_empty() {
         eprintln!("No sessions found.");
@@ -184,11 +179,10 @@ fn run_session(
     wav_path: &str,
     start_time: chrono::DateTime<Local>,
     segment_index: i64,
-    conn: &rusqlite::Connection,
 ) -> Result<()> {
     let mic_name = recorder::default_input_device_name().unwrap_or_else(|| "Unknown".into());
     let mut app = app::App::new(notes_path.to_string(), start_time, mic_name);
-    run_with_recorder(&mut app, wav_path, name, segment_index, None, conn)
+    run_with_recorder(&mut app, wav_path, name, segment_index, None)
 }
 
 fn run_with_recorder(
@@ -197,8 +191,8 @@ fn run_with_recorder(
     session_name: &str,
     mut segment_index: i64,
     initial_device: Option<cpal::Device>,
-    conn: &rusqlite::Connection,
 ) -> Result<()> {
+    let dir = aside_dir();
     let mut current_wav = wav_path.to_string();
     let mut current_device = initial_device;
 
@@ -213,7 +207,7 @@ fn run_with_recorder(
         // TUI has exited, stop_flag is set. Now finalize recording.
         stop_flag.store(true, Ordering::SeqCst);
         let duration = recorder.stop_and_write(&current_wav)?;
-        session::update_segment_duration(conn, session_name, segment_index, duration)?;
+        session::update_segment_duration(&dir, session_name, segment_index, duration)?;
 
         match tui_result {
             Ok(tui::TuiAction::Quit) => return Ok(()),
@@ -232,12 +226,12 @@ fn run_with_recorder(
                 }
 
                 // Create a new segment
-                segment_index = session::next_segment_index(conn, session_name)?;
+                segment_index = session::next_segment_index(&dir, session_name)?;
                 current_wav =
                     format!(".aside/{}_seg{}.wav", session_name, segment_index);
                 let offset_ms = (Local::now() - app.start_time).num_milliseconds();
                 session::add_segment(
-                    conn,
+                    &dir,
                     session_name,
                     segment_index,
                     &current_wav,

@@ -1,7 +1,7 @@
 ---
 name: aside
 description: End-to-end aside session processing — transcribe, align memo + transcript, distill into a structured vault note via Enzyme.
-argument-hint: <session-name> [--template name] [--prep path] [--transcript path] [--align-only]
+argument-hint: <session-name> [--align-only]
 user-invocable: true
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion, mcp__enzyme__semantic_search, mcp__enzyme__start_exploring_vault
 ---
@@ -21,15 +21,12 @@ If `--align-only` is passed, only the aligned timeline (step 1) is produced.
 
 ## Arguments
 
-`$ARGUMENTS` format: `<session-name> [--template <name>] [--prep <path>] [--transcript <path>] [--align-only]`
+`$ARGUMENTS` format: `<session-name> [--align-only]`
 
 - **session-name** (required): The aside session name (e.g., `my-call`). Used to find:
   - Memo: `<session-name>.md` (in the aside working directory)
   - Audio: `.aside/<session-name>_seg*.wav`
   - DB: `.aside/.aside.db` (for segment offsets and durations)
-- **--template** (optional): Template name for the vault note (default: `1on1-idea-exchange`). Templates live in `$OBSIDIAN_VAULT/.claude/commands/transcript/templates/`.
-- **--prep** (optional): Path to prep notes file for additional context during distillation.
-- **--transcript** (optional): Path to an existing transcript file. If omitted, transcribes the WAV segments using aside.py.
 - **--align-only** (optional): Stop after producing the aligned timeline. Skip distillation.
 
 ### Parsing $ARGUMENTS
@@ -39,26 +36,12 @@ $ARGUMENTS = "standup"
 -> session: "standup"
 -> memo: "standup.md"
 -> audio: ".aside/standup_seg*.wav"
--> transcript: (generate from WAV)
--> template: "1on1-idea-exchange" (default)
--> output: ".aside/standup_aligned.md"
-
-$ARGUMENTS = "standup --transcript inbox/standup-transcript.md --template discovery-call"
--> session: "standup"
--> transcript: "inbox/standup-transcript.md"
--> template: "discovery-call"
 -> output: ".aside/standup_aligned.md"
 
 $ARGUMENTS = "standup --align-only"
 -> session: "standup"
--> transcript: (generate from WAV)
 -> output: ".aside/standup_aligned.md"
 -> STOP after Phase I
-
-$ARGUMENTS = "standup --prep inbox/standup-prep.md"
--> session: "standup"
--> prep: "inbox/standup-prep.md"
--> full pipeline
 ```
 
 ---
@@ -81,21 +64,14 @@ $ARGUMENTS = "standup --prep inbox/standup-prep.md"
 
 If the memo file doesn't exist, ask the user for the correct session name.
 
-### Step 2: Obtain transcript
+### Step 2: Transcribe audio
 
-**If `--transcript` was provided:**
-
-Read the transcript file. Supported formats:
-- **Hyprnote transcript.json**: Parse `transcripts[0].words[]`, each with `start_ms`, `end_ms`, `text`, `channel`
-- **Timestamped markdown**: Lines like `[00:05] Speaker: text` or entries with `start_ms`/`end_ms` markers
-- **Plain text with speaker labels**: `Speaker A: ...` / `Me: ...` — no timestamps, align by order only
-
-**If no transcript provided, generate one:**
-
-For each WAV segment:
+For each WAV segment, run:
 ```bash
 python3 aside.py ".aside/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
 ```
+
+This produces a JSON file with `transcripts[0].words[]`, each entry containing `start_ms`, `end_ms`, `text`, and `channel`.
 
 When there are multiple segments (from device switches), adjust transcript timestamps by each segment's `offset_ms` from the database so they align to the session's global timeline.
 
@@ -110,7 +86,7 @@ Build a list of timed events from both sources:
 
 Parse timestamps using the `[MM:SS]` or `[HH:MM:SS]` format. Lines with `~` have an edit timestamp indicating the note was revised.
 
-**From the transcript** — each phrase/entry becomes:
+**From the transcript JSON** — each word entry becomes:
 ```
 { type: "transcript", time_s: <start_ms / 1000>, end_s: <end_ms / 1000>, channel: 0|1, text: "..." }
 ```
@@ -212,8 +188,6 @@ The memo is the user's real-time attention signal — what they found important 
 
 4. **Build a prioritized topic list.** Memo-marked topics first (ordered by classification weight: decisions > action items > insights > tensions > questions > observations), then significant un-noted topics.
 
-If `--prep` was provided, read the prep notes and compare: what the user came in wanting vs. what actually happened. Note gaps and surprises.
-
 ### Step 6: Enzyme vault search
 
 Connect the conversation to existing vault thinking.
@@ -261,12 +235,7 @@ After both structured and semantic results come back:
 
 ### Step 7: Template + draft
 
-1. **Load template** from `$OBSIDIAN_VAULT/.claude/commands/transcript/templates/`. Available templates:
-   - `1on1-idea-exchange` (default) — for idea-rich 1:1 conversations
-   - `discovery-call` — for client/prospect calls
-   - `group-conversation` — for multi-person discussions
-
-   If the requested template doesn't exist, list available templates and ask the user to choose.
+1. **Load template** `1on1-idea-exchange` from `$OBSIDIAN_VAULT/.claude/commands/transcript/templates/`.
 
 2. **Generate draft** following these principles:
 
@@ -324,7 +293,7 @@ mv "$OBSIDIAN_VAULT/inbox/[timestamp].md" "$OBSIDIAN_VAULT/inbox/[timestamp] [de
 Many transcripts come from speech-to-text and contain fragmented, garbled text. When you encounter this:
 
 - Reconstruct the most likely intended meaning from context
-- Use memo lines and prep notes (if available) to disambiguate unclear passages
+- Use memo lines to disambiguate unclear passages
 - Preserve distinctive phrasing even when surrounding text is garbled
 - If a passage is genuinely unrecoverable, note it as `[unclear]` rather than guessing
 - Don't reproduce speech-to-text artifacts ("I. Mean. That. The.") — clean them up
@@ -337,13 +306,4 @@ Many transcripts come from speech-to-text and contain fragmented, garbled text. 
 
 /aside standup --align-only
 # Only produce the aligned timeline, skip distillation
-
-/aside planning --transcript inbox/planning-transcript.md
-# Align with an existing transcript, then distill
-
-/aside planning --template discovery-call --prep inbox/planning-prep.md
-# Full pipeline with specific template and prep notes
-
-/aside planning --transcript inbox/planning-transcript.md --align-only
-# Align an existing transcript with memo, skip distillation
 ```

@@ -1,119 +1,111 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub fn open_db(db_path: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path).context("failed to open session database")?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS sessions (
-            name        TEXT PRIMARY KEY,
-            start_time  TEXT NOT NULL,
-            notes_path  TEXT NOT NULL,
-            created_at  TEXT NOT NULL,
-            updated_at  TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS segments (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_name    TEXT NOT NULL REFERENCES sessions(name),
-            segment_index   INTEGER NOT NULL,
-            wav_path        TEXT NOT NULL,
-            offset_ms       INTEGER NOT NULL,
-            duration_secs   REAL,
-            started_at      TEXT NOT NULL,
-            UNIQUE(session_name, segment_index)
-        );",
-    )?;
-    Ok(conn)
+#[derive(Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub name: String,
+    pub start_time: String,
+    pub notes_path: String,
+    pub created_at: String,
+    pub segments: Vec<SegmentMeta>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SegmentMeta {
+    pub segment_index: i64,
+    pub wav_path: String,
+    pub offset_ms: i64,
+    pub duration_secs: Option<f64>,
+    pub started_at: String,
+}
+
+fn meta_path(dir: &Path, name: &str) -> std::path::PathBuf {
+    dir.join(format!("{}.meta.json", name))
+}
+
+fn read_meta(dir: &Path, name: &str) -> Result<SessionMeta> {
+    let path = meta_path(dir, name);
+    let data = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read session file {:?}", path))?;
+    serde_json::from_str(&data).context("failed to parse session JSON")
+}
+
+fn write_meta(dir: &Path, meta: &SessionMeta) -> Result<()> {
+    let path = meta_path(dir, &meta.name);
+    let data = serde_json::to_string_pretty(meta).context("failed to serialize session JSON")?;
+    std::fs::write(&path, data).with_context(|| format!("failed to write {:?}", path))
 }
 
 pub fn create_session(
-    conn: &Connection,
+    dir: &Path,
     name: &str,
     start_time: &DateTime<Local>,
     notes_path: &str,
 ) -> Result<()> {
     let now = Local::now().to_rfc3339();
-    let start = start_time.to_rfc3339();
-    conn.execute(
-        "INSERT INTO sessions (name, start_time, notes_path, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![name, start, notes_path, now, now],
-    )
-    .context("failed to create session (name already exists?)")?;
-    Ok(())
+    let meta = SessionMeta {
+        name: name.to_string(),
+        start_time: start_time.to_rfc3339(),
+        notes_path: notes_path.to_string(),
+        created_at: now,
+        segments: Vec::new(),
+    };
+    write_meta(dir, &meta)
 }
 
-pub fn get_session_start_time(conn: &Connection, name: &str) -> Result<DateTime<Local>> {
-    let start_str: String = conn
-        .query_row(
-            "SELECT start_time FROM sessions WHERE name = ?1",
-            rusqlite::params![name],
-            |row| row.get(0),
-        )
-        .context(format!("session '{}' not found in database", name))?;
-    let dt = DateTime::parse_from_rfc3339(&start_str)
-        .context("invalid start_time in database")?
+pub fn session_exists(dir: &Path, name: &str) -> Result<bool> {
+    Ok(meta_path(dir, name).exists())
+}
+
+pub fn get_session_start_time(dir: &Path, name: &str) -> Result<DateTime<Local>> {
+    let meta = read_meta(dir, name)?;
+    let dt = DateTime::parse_from_rfc3339(&meta.start_time)
+        .context("invalid start_time in session file")?
         .with_timezone(&Local);
     Ok(dt)
 }
 
-pub fn session_exists(conn: &Connection, name: &str) -> Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sessions WHERE name = ?1",
-        rusqlite::params![name],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
-}
-
-pub fn next_segment_index(conn: &Connection, session_name: &str) -> Result<i64> {
-    let max: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(segment_index) FROM segments WHERE session_name = ?1",
-            rusqlite::params![session_name],
-            |row| row.get(0),
-        )
-        .unwrap_or(None);
-    Ok(max.map(|m| m + 1).unwrap_or(0))
+pub fn next_segment_index(dir: &Path, session_name: &str) -> Result<i64> {
+    let meta = read_meta(dir, session_name)?;
+    Ok(meta.segments.len() as i64)
 }
 
 pub fn add_segment(
-    conn: &Connection,
+    dir: &Path,
     session_name: &str,
     segment_index: i64,
     wav_path: &str,
     offset_ms: i64,
     duration_secs: Option<f64>,
 ) -> Result<()> {
-    let now = Local::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO segments (session_name, segment_index, wav_path, offset_ms, duration_secs, started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![session_name, segment_index, wav_path, offset_ms, duration_secs, now],
-    )
-    .context("failed to add segment")?;
-
-    // Update session's updated_at
-    conn.execute(
-        "UPDATE sessions SET updated_at = ?1 WHERE name = ?2",
-        rusqlite::params![now, session_name],
-    )?;
-
-    Ok(())
+    let mut meta = read_meta(dir, session_name)?;
+    meta.segments.push(SegmentMeta {
+        segment_index,
+        wav_path: wav_path.to_string(),
+        offset_ms,
+        duration_secs,
+        started_at: Local::now().to_rfc3339(),
+    });
+    write_meta(dir, &meta)
 }
 
 pub fn update_segment_duration(
-    conn: &Connection,
+    dir: &Path,
     session_name: &str,
     segment_index: i64,
     duration_secs: f64,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE segments SET duration_secs = ?1 WHERE session_name = ?2 AND segment_index = ?3",
-        rusqlite::params![duration_secs, session_name, segment_index],
-    )?;
-    Ok(())
+    let mut meta = read_meta(dir, session_name)?;
+    if let Some(seg) = meta
+        .segments
+        .iter_mut()
+        .find(|s| s.segment_index == segment_index)
+    {
+        seg.duration_secs = Some(duration_secs);
+    }
+    write_meta(dir, &meta)
 }
 
 pub struct SessionInfo {
@@ -121,28 +113,32 @@ pub struct SessionInfo {
     pub start_time: String,
     pub notes_path: String,
     pub segment_count: i64,
-    pub updated_at: String,
 }
 
-pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionInfo>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.name, s.start_time, s.notes_path, s.updated_at,
-                (SELECT COUNT(*) FROM segments WHERE session_name = s.name)
-         FROM sessions s
-         ORDER BY s.created_at DESC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(SessionInfo {
-            name: row.get(0)?,
-            start_time: row.get(1)?,
-            notes_path: row.get(2)?,
-            updated_at: row.get(3)?,
-            segment_count: row.get(4)?,
-        })
-    })?;
+pub fn list_sessions(dir: &Path) -> Result<Vec<SessionInfo>> {
     let mut sessions = Vec::new();
-    for row in rows {
-        sessions.push(row?);
+
+    let entries = std::fs::read_dir(dir).context("failed to read .aside/ directory")?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.ends_with(".meta.json") {
+                    let data = std::fs::read_to_string(&path)?;
+                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
+                        sessions.push(SessionInfo {
+                            name: meta.name,
+                            start_time: meta.start_time,
+                            notes_path: meta.notes_path,
+                            segment_count: meta.segments.len() as i64,
+                        });
+                    }
+                }
+            }
+        }
     }
+
+    sessions.sort_by(|a, b| b.start_time.cmp(&a.start_time));
     Ok(sessions)
 }

@@ -1,57 +1,67 @@
 ---
 name: aside
-description: Align an aside session's timestamped memo with its audio transcript into an interleaved timeline artifact for synthesis. Use when the user has an aside session (memo + WAV) and wants to combine it with a transcript for downstream processing like /transcript.
-argument-hint: <session-name> [--transcript path] [--output path]
+description: End-to-end aside session processing — transcribe, align memo + transcript, distill into a structured vault note via Enzyme.
+argument-hint: <session-name> [--template name] [--prep path] [--transcript path] [--align-only]
 user-invocable: true
-allowed-tools: Bash, Read, Write, Glob, Grep, AskUserQuestion
+allowed-tools: Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion, mcp__enzyme__semantic_search, mcp__enzyme__start_exploring_vault
 ---
 
-# Aside — Memo + Transcript Alignment
+# Aside — Capture to Vault Note
 
-Take an aside session's timestamped memo and its audio transcript, align them on a shared timeline, and produce an interleaved artifact that can be used for synthesis (e.g., by `/transcript`).
+Take an aside session end-to-end: transcribe audio, align the transcript with the user's real-time memo, distill into a structured vault note connected to existing thinking via Enzyme.
 
 ## What this produces
 
-An intermediate markdown document that interleaves two streams by timestamp:
+1. **Aligned timeline** (`.aside/<session>_aligned.md`) — interleaved transcript + memo on a shared timeline
+2. **Vault note** — structured note written to the obsidian vault using a template, with Enzyme-sourced connections
 
-- **Transcript entries** — what was actually said (from aside.py or another transcription source)
-- **Memo annotations** — what the user noted in real time during the session
-
-This combined artifact preserves both the raw conversation and the user's live attention signal: what they found important enough to write down, and when.
+If `--align-only` is passed, only the aligned timeline (step 1) is produced.
 
 ## Arguments
 
-`$ARGUMENTS` format: `<session-name> [--transcript <path>] [--output <path>]`
+`$ARGUMENTS` format: `<session-name> [--template <name>] [--prep <path>] [--transcript <path>] [--align-only]`
 
 - **session-name** (required): The aside session name (e.g., `my-call`). Used to find:
   - Memo: `<session-name>.md` (in the aside working directory)
-  - Audio: `recordings/<session-name>_seg*.wav`
-  - DB: `recordings/.aside.db` (for segment offsets and durations)
-- **--transcript** (optional): Path to an existing transcript file. If omitted, transcribes the WAV segments first using aside.py.
-- **--output** (optional): Output path for the aligned artifact. Defaults to `<session-name>_aligned.md`.
+  - Audio: `.aside/<session-name>_seg*.wav`
+  - DB: `.aside/.aside.db` (for segment offsets and durations)
+- **--template** (optional): Template name for the vault note (default: `1on1-idea-exchange`). Templates live in `/Users/joshuapham/obsidian/.claude/commands/transcript/templates/`.
+- **--prep** (optional): Path to prep notes file for additional context during distillation.
+- **--transcript** (optional): Path to an existing transcript file. If omitted, transcribes the WAV segments using aside.py.
+- **--align-only** (optional): Stop after producing the aligned timeline. Skip distillation.
 
 ### Parsing $ARGUMENTS
 
 ```
 $ARGUMENTS = "standup"
-→ session: "standup"
-→ memo: "standup.md"
-→ audio: "recordings/standup_seg*.wav"
-→ transcript: (generate from WAV)
-→ output: "standup_aligned.md"
+-> session: "standup"
+-> memo: "standup.md"
+-> audio: ".aside/standup_seg*.wav"
+-> transcript: (generate from WAV)
+-> template: "1on1-idea-exchange" (default)
+-> output: ".aside/standup_aligned.md"
 
-$ARGUMENTS = "standup --transcript inbox/standup-transcript.md"
-→ session: "standup"
-→ transcript: "inbox/standup-transcript.md"
-→ output: "standup_aligned.md"
+$ARGUMENTS = "standup --transcript inbox/standup-transcript.md --template discovery-call"
+-> session: "standup"
+-> transcript: "inbox/standup-transcript.md"
+-> template: "discovery-call"
+-> output: ".aside/standup_aligned.md"
 
-$ARGUMENTS = "standup --output inbox/standup-combined.md"
-→ session: "standup"
-→ transcript: (generate from WAV)
-→ output: "inbox/standup-combined.md"
+$ARGUMENTS = "standup --align-only"
+-> session: "standup"
+-> transcript: (generate from WAV)
+-> output: ".aside/standup_aligned.md"
+-> STOP after Phase I
+
+$ARGUMENTS = "standup --prep inbox/standup-prep.md"
+-> session: "standup"
+-> prep: "inbox/standup-prep.md"
+-> full pipeline
 ```
 
-## Execution
+---
+
+## Phase I — Alignment
 
 ### Step 1: Locate session artifacts
 
@@ -63,9 +73,9 @@ $ARGUMENTS = "standup --output inbox/standup-combined.md"
    ```
 2. Query the session database for segment info:
    ```bash
-   sqlite3 recordings/.aside.db "SELECT segment_index, wav_path, offset_ms, duration_secs FROM segments WHERE session_name = '<session-name>' ORDER BY segment_index"
+   sqlite3 .aside/.aside.db "SELECT segment_index, wav_path, offset_ms, duration_secs FROM segments WHERE session_name = '<session-name>' ORDER BY segment_index"
    ```
-3. List WAV segments: `recordings/<session-name>_seg*.wav`
+3. List WAV segments: `.aside/<session-name>_seg*.wav`
 
 If the memo file doesn't exist, ask the user for the correct session name.
 
@@ -82,7 +92,7 @@ Read the transcript file. Supported formats:
 
 For each WAV segment:
 ```bash
-python3 ~/Hacks/aside/aside.py "recordings/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
+python3 ~/Hacks/aside/aside.py ".aside/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
 ```
 
 When there are multiple segments (from device switches), adjust transcript timestamps by each segment's `offset_ms` from the database so they align to the session's global timeline.
@@ -172,36 +182,166 @@ Sort all events by timestamp. Write a markdown document with this structure:
 - If a memo line falls within a transcript window, place it after the transcript lines it corresponds to
 - If a memo line has no nearby transcript (e.g., during silence), include it in sequence anyway
 
-### Step 5: Write output
+Write the aligned artifact to `.aside/<session-name>_aligned.md`. Report to the user:
 
-Write the aligned artifact to the output path. Report to the user:
+> Aligned <N> memo lines with <M> transcript entries across <duration>. Output: `.aside/<session-name>_aligned.md`
 
-> Aligned <N> memo lines with <M> transcript entries across <duration>. Output: `<path>`
+**If `--align-only` was passed, stop here.**
 
-## Relationship to /transcript
+---
 
-The aligned artifact from `/aside` is designed as **input** to `/transcript`. The workflow:
+## Phase II — Distillation
 
-1. **Record**: Run `aside <session-name>` — take notes while recording
-2. **Align**: `/aside <session-name>` — produces the interleaved timeline
-3. **Synthesize**: `/transcript <aligned-artifact>.md` — processes into structured vault notes
+### Step 5: Memo-guided analysis
 
-The aligned artifact gives `/transcript` two signals it wouldn't otherwise have:
-- **The user's real-time attention** — memo lines mark what the user considered important during the conversation, not in hindsight
-- **Temporal context** — knowing *when* the user wrote a note relative to the conversation helps weight and structure the output
+The memo is the user's real-time attention signal — what they found important enough to write down during the conversation, not in hindsight. Use it to drive analysis priority.
+
+1. **Extract topics from memo lines first.** Each memo line marks a moment the user chose to note. Classify each line:
+   - **Decision** — a choice was made ("decided on JWT")
+   - **Action item** — a commitment or next step ("Josh to draft RFC by Friday")
+   - **Insight** — a realization or interesting framing ("the real bottleneck is onboarding, not retention")
+   - **Tension** — a disagreement or unresolved question ("revisited auth approach")
+   - **Question** — something to follow up on
+   - **Observation** — neutral notation of what's being discussed
+
+2. **Edited memos (`~` timestamps) signal reconsideration.** A memo line with `[01:30 ~02:15]` means the user wrote something at 01:30 and came back to edit it at 02:15. This indicates the topic was important enough to revisit. Weight these higher.
+
+3. **Extract topics from un-noted transcript.** Scan the transcript for significant topics that the user did *not* memo. These are secondary — the user may have chosen not to note them for a reason, or they may have been too absorbed to write.
+
+4. **Build a prioritized topic list.** Memo-marked topics first (ordered by classification weight: decisions > action items > insights > tensions > questions > observations), then significant un-noted topics.
+
+If `--prep` was provided, read the prep notes and compare: what the user came in wanting vs. what actually happened. Note gaps and surprises.
+
+### Step 6: Enzyme vault search
+
+Connect the conversation to existing vault thinking.
+
+#### Phase A: Explore the vault
+
+Run `mcp__enzyme__start_exploring_vault` first. This returns the **slate** — trending entities with catalysts that represent where the vault has already found language for things. Use the slate to calibrate search queries: if the transcript discusses "knowledge management tools" but the vault uses "pkm" or "tool-thinking", reach for the vault's language.
+
+#### Phase B: Search for connections
+
+Use **two search strategies**:
+
+**Structured search (Grep)** — for concrete anchors that exist verbatim in the vault:
+- People mentioned: `[[John Borthwick]]`, `[[Chris Perry]]`
+- Tags from the slate that match transcript topics: `#pkm`, `#ai-ux`
+- Companies or proper nouns: "Betaworks", "Readwise"
+- Wikilinks or note titles
+
+Run Grep for each concrete anchor. Prioritize anchors that appear near memo-marked topics.
+
+**Semantic search** — for themes and concepts without a concrete anchor:
+- Formulate 2-3 queries from the prioritized topic list (Step 5), using the vault's vocabulary where possible
+- Focus on memo-marked topics first, then significant un-noted topics
+- Queries should be substantive and specific, drawn from actual conversation content
+
+**Good queries** (drawn from specific themes, calibrated to vault language):
+- "happenstance interfaces and serendipity in knowledge tools"
+- "creative tool vs consumer tool positioning"
+- "behavioral graph as enabler business"
+
+**Bad queries** (generic):
+- "meeting notes"
+- "conversation summary"
+- "knowledge management"
+
+For each query, run `mcp__enzyme__semantic_search` with `result_limit: 5`.
+
+#### Phase C: Read and collect
+
+After both structured and semantic results come back:
+- Read the top 3-5 most relevant notes
+- Note **existing tags** that appear in those notes (for use in the output — never invent tags)
+- Note **people links** (`[[Person Name]]`) that appear
+- Note **connections** between the transcript content and vault content — these become citations in the draft
+
+### Step 7: Template + draft
+
+1. **Load template** from `/Users/joshuapham/obsidian/.claude/commands/transcript/templates/`. Available templates:
+   - `1on1-idea-exchange` (default) — for idea-rich 1:1 conversations
+   - `discovery-call` — for client/prospect calls
+   - `group-conversation` — for multi-person discussions
+
+   If the requested template doesn't exist, list available templates and ask the user to choose.
+
+2. **Generate draft** following these principles:
+
+   **Topic ordering**: Use the memo-weighted priority from Step 5. Decisions and action items surface first, then insights and tensions, then un-noted topics. This reflects what the user actually cared about during the conversation.
+
+   **Content principles:**
+   - Preserve specific language and direct quotes — use their actual words
+   - Reconstruct fragmented speech-to-text into intended meaning; flag uncertain reconstructions with [reconstructed]
+   - Weave in vault context as natural `[[wikilink]]` citations where connections exist
+   - Populate frontmatter with tags extracted from Enzyme results only (never invent tags)
+   - Add people to the `people:` field using `[[Name]]` format
+   - Skip pleasantries, logistics, and small talk unless they contained real content
+   - Prioritize specificity over comprehensiveness — five vivid points beat fifteen generic bullets
+
+   **Writing style:**
+   - Direct statements over contrast constructions (no "doesn't X, but Y" patterns)
+   - Use em dashes sparingly
+   - No rhetorical questions as transitions
+   - Avoid AI-typical phrases: "disappears into the background", "perhaps the better question is", "conceived as"
+   - Active voice, concrete language, varied sentence construction
+
+   **Citation integration:**
+   - Reference vault notes naturally: `as explored in [[note title]]` or `connects to [[note title]]`
+   - Use block embeds `![[file#^block-id]]` only when the source has explicit block IDs and the quote is concise and directly relevant
+   - Don't force connections — only cite where the link genuinely enriches the note
+
+### Step 8: Review
+
+Present the complete draft to the user. Ask:
+- Does the structure capture what mattered in this conversation?
+- Any sections to expand, trim, or restructure?
+- Any quotes or moments missing that should be included?
+
+Apply revisions if requested. Iterate until the user is satisfied.
+
+### Step 9: Write to vault
+
+Once approved:
+
+1. Create the note via `./scripts/new-note.sh` (run from `/Users/joshuapham/obsidian/`)
+2. Populate with the approved content using the Edit tool
+3. Rename with a descriptive suffix following vault naming conventions:
+   - Keep timestamp prefix
+   - Add 3-7 word descriptive name, lowercase
+   - Pattern for conversations: `[timestamp] chat with [person] about [topic].md`
+
+```bash
+mv "/Users/joshuapham/obsidian/inbox/[timestamp].md" "/Users/joshuapham/obsidian/inbox/[timestamp] [descriptive name].md"
+```
+
+---
+
+## Handling Poor Transcript Quality
+
+Many transcripts come from speech-to-text and contain fragmented, garbled text. When you encounter this:
+
+- Reconstruct the most likely intended meaning from context
+- Use memo lines and prep notes (if available) to disambiguate unclear passages
+- Preserve distinctive phrasing even when surrounding text is garbled
+- If a passage is genuinely unrecoverable, note it as `[unclear]` rather than guessing
+- Don't reproduce speech-to-text artifacts ("I. Mean. That. The.") — clean them up
 
 ## Example Invocations
 
 ```
 /aside standup
-# Transcribe WAV segments and align with memo for the "standup" session
+# Full pipeline: transcribe, align, distill into vault note
+
+/aside standup --align-only
+# Only produce the aligned timeline, skip distillation
 
 /aside planning --transcript inbox/planning-transcript.md
-# Align memo with an existing transcript file
+# Align with an existing transcript, then distill
 
-/aside planning --output inbox/planning-aligned.md
-# Specify output location
+/aside planning --template discovery-call --prep inbox/planning-prep.md
+# Full pipeline with specific template and prep notes
 
-/aside planning --transcript inbox/planning-transcript.md --output inbox/planning-aligned.md
-# Both explicit transcript and output
+/aside planning --transcript inbox/planning-transcript.md --align-only
+# Align an existing transcript with memo, skip distillation
 ```

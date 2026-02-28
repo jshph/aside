@@ -11,6 +11,25 @@ use cidre::{arc, av, cat, cf, core_audio as ca, ns, os};
 
 const TAP_NAME: &str = "aside-tap";
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
+/// Check (and request on first run) screen/audio capture permission.
+/// Returns true if permission is granted.
+#[cfg(target_os = "macos")]
+pub fn ensure_audio_capture_permission() -> bool {
+    unsafe {
+        if CGPreflightScreenCaptureAccess() {
+            return true;
+        }
+        // Triggers the system permission dialog on first run
+        CGRequestScreenCaptureAccess()
+    }
+}
+
 /// +20 dB gain applied to mic input. Raw hardware levels from built-in macs
 /// and USB mics (e.g. Yeti at moderate gain) typically sit around -50 to -40
 /// dBFS RMS; this brings speech into the -30 to -20 dBFS range.
@@ -235,9 +254,13 @@ fn start_speaker(tx: mpsc::Sender<Vec<f32>>) -> Result<(SpeakerCapture, u32)> {
 
     let mut ctx = Box::new(SpeakerCtx { tx, format });
 
-    let agg_device = ca::AggregateDevice::with_desc(&agg_desc)?;
-    let proc_id = agg_device.create_io_proc_id(speaker_io_proc, Some(&mut ctx))?;
-    let device = ca::device_start(agg_device, Some(proc_id))?;
+    let agg_device = ca::AggregateDevice::with_desc(&agg_desc)
+        .map_err(|e| anyhow::anyhow!("AggregateDevice::with_desc failed: {}", e))?;
+    let proc_id = agg_device
+        .create_io_proc_id(speaker_io_proc, Some(&mut ctx))
+        .map_err(|e| anyhow::anyhow!("create_io_proc_id failed: {}", e))?;
+    let device = ca::device_start(agg_device, Some(proc_id))
+        .map_err(|e| anyhow::anyhow!("device_start failed: {}", e))?;
 
     Ok((
         SpeakerCapture {

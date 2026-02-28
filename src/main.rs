@@ -34,6 +34,15 @@ fn main() -> Result<()> {
         return cmd_list();
     }
 
+    // Check audio capture permission before starting any recording session
+    #[cfg(target_os = "macos")]
+    if !recorder::ensure_audio_capture_permission() {
+        eprintln!("Warning: Screen & System Audio Recording permission not granted.");
+        eprintln!("System audio capture will be silent. Grant permission in:");
+        eprintln!("  System Settings → Privacy & Security → Screen & System Audio Recording");
+        eprintln!("Then restart aside.");
+    }
+
     if let Some(name) = args.resume {
         return cmd_resume(&name);
     }

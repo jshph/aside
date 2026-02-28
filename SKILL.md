@@ -12,6 +12,11 @@ Take an aside session end-to-end: transcribe audio, align the transcript with th
 
 **Environment**: `$OBSIDIAN_VAULT` refers to the Obsidian vault root (the additional working directory configured for this project).
 
+## Prerequisites
+
+- `brew install whisper-cpp` — provides `whisper-cli` for transcription
+- Download model: `hf download ggerganov/whisper.cpp ggml-large-v3-turbo.bin --local-dir ~/.local/share/whisper-cpp/`
+
 ## What this produces
 
 1. **Aligned timeline** (`.aside/<session>_aligned.md`) — interleaved transcript + memo on a shared timeline
@@ -26,7 +31,7 @@ If `--align-only` is passed, only the aligned timeline (step 1) is produced.
 - **session-name** (required): The aside session name (e.g., `my-call`). Used to find:
   - Memo: `<session-name>.md` (in the aside working directory)
   - Audio: `.aside/<session-name>_seg*.wav`
-  - DB: `.aside/.aside.db` (for segment offsets and durations)
+  - Metadata: `.aside/<session-name>.meta.json` (for segment offsets and durations)
 - **--align-only** (optional): Stop after producing the aligned timeline. Skip distillation.
 
 ### Parsing $ARGUMENTS

@@ -2,12 +2,12 @@
 """Transcribe a stereo WAV file into Hyprnote transcript.json format.
 
 Splits stereo audio into per-channel mono files, transcribes each with
-mlx-whisper, then runs multi-pass cleanup to remove hallucinations,
-deduplicate words, strip backchannels/fillers, and merge overlapping
-speech into clean turn-taking entries.
+whisper-cli (whisper.cpp), then runs multi-pass cleanup to remove
+hallucinations, deduplicate words, strip backchannels/fillers, and merge
+overlapping speech into clean turn-taking entries.
 
 Usage:
-    python3 aside.py <wav_path> [--output <path>] [--keep-backchannels] [--model <repo>]
+    python3 aside.py <wav_path> [--output <path>] [--keep-backchannels] [--model <path>]
 
 Stdout protocol (machine-parseable lines):
     SPLITTING_CHANNELS          splitting stereo into mono
@@ -30,7 +30,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 
-DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+DEFAULT_MODEL = "ggml-large-v3-turbo.bin"
 
 # ---------------------------------------------------------------------------
 # Backchannel / filler constants
@@ -102,28 +102,73 @@ def split_stereo(path: str) -> tuple[str, str]:
     return ch0, ch1
 
 
-def transcribe_channel(audio_path: str, channel: int, model: str) -> list[dict]:
-    """Transcribe a mono WAV and return word dicts in Hyprnote schema."""
-    import mlx_whisper  # defer import so --help works without the dep
+def _resolve_model_path(model: str) -> str:
+    """Resolve a whisper-cli model path.
 
-    result = mlx_whisper.transcribe(
-        audio_path,
-        path_or_hf_repo=model,
-        word_timestamps=True,
-        language="en",
-        hallucination_silence_threshold=2.0,
-        condition_on_previous_text=False,
+    If model is an absolute path, use it directly. Otherwise look in the
+    conventional ~/.local/share/whisper-cpp/ directory.
+    """
+    if os.path.isabs(model) and os.path.isfile(model):
+        return model
+
+    conventional = os.path.expanduser(f"~/.local/share/whisper-cpp/{model}")
+    if os.path.isfile(conventional):
+        return conventional
+
+    print(
+        f"ERROR:Model not found: {model}\n"
+        f"Download with: hf download ggerganov/whisper.cpp {model} "
+        f"--local-dir ~/.local/share/whisper-cpp/",
+        file=sys.stdout,
     )
+    sys.exit(1)
+
+
+def transcribe_channel(audio_path: str, channel: int, model: str) -> list[dict]:
+    """Transcribe a mono WAV via whisper-cli and return word dicts."""
+    model_path = _resolve_model_path(model)
+
+    out_prefix = tempfile.mktemp(suffix="_whisper")
+
+    try:
+        subprocess.run(
+            [
+                "whisper-cli",
+                "-m", model_path,
+                "-f", audio_path,
+                "-l", "en",
+                "-ojf",
+                "-of", out_prefix,
+                "--max-context", "0",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+
+        json_path = out_prefix + ".json"
+        with open(json_path) as f:
+            data = json.load(f)
+    finally:
+        for suffix in (".json", ""):
+            try:
+                os.unlink(out_prefix + suffix)
+            except OSError:
+                pass
 
     words = []
-    for seg in result.get("segments", []):
-        for w in seg.get("words", []):
+    for segment in data.get("transcription", []):
+        for tok in segment.get("tokens", []):
+            if tok.get("id", 0) >= 50000:
+                continue
+            text = tok.get("text", "")
+            if text.startswith("["):
+                continue
+            offsets = tok.get("offsets", {})
             words.append({
                 "channel": channel,
-                "end_ms": int(w["end"] * 1000),
+                "start_ms": offsets.get("from", 0),
+                "end_ms": offsets.get("to", 0),
                 "id": str(uuid.uuid4()),
-                "start_ms": int(w["start"] * 1000),
-                "text": w["word"],
+                "text": text,
             })
     return words
 

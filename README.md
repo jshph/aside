@@ -1,5 +1,7 @@
 # aside
 
+![aside demo](assets/demo.gif)
+
 Record meetings with a timestamped notepad running alongside. Then turn the recording + your notes into a vault-connected artifact that beats what the transcript can do alone.
 
 ## Why this exists

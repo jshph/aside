@@ -3,37 +3,25 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SizedSample;
 use dasp::sample::ToSample;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use cidre::{arc, av, cat, cf, core_audio as ca, ns, os};
 
 const TAP_NAME: &str = "aside-tap";
 
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn CGRequestScreenCaptureAccess() -> bool;
-    fn CGPreflightScreenCaptureAccess() -> bool;
-}
-
-/// Check (and request on first run) screen/audio capture permission.
-/// Returns true if permission is granted.
-#[cfg(target_os = "macos")]
-pub fn ensure_audio_capture_permission() -> bool {
-    unsafe {
-        if CGPreflightScreenCaptureAccess() {
-            return true;
-        }
-        // Triggers the system permission dialog on first run
-        CGRequestScreenCaptureAccess()
-    }
-}
-
 /// +20 dB gain applied to mic input. Raw hardware levels from built-in macs
 /// and USB mics (e.g. Yeti at moderate gain) typically sit around -50 to -40
 /// dBFS RMS; this brings speech into the -30 to -20 dBFS range.
 const MIC_GAIN: f32 = 10.0;
+
+/// Pre-allocated ring buffer capacity: 2 seconds of audio at 48kHz.
+/// Gives the consumer thread plenty of slack to drain without drops.
+const RING_BUF_SECONDS: usize = 2;
+
+/// How often the consumer thread drains the ring buffer.
+const DRAIN_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Handle to a running recorder. Call `stop_and_write()` to finalize.
 pub struct RecorderHandle {
@@ -50,11 +38,8 @@ impl RecorderHandle {
     /// Start capturing mic + system audio. Returns immediately.
     /// If `device` is `Some`, uses that mic; otherwise uses the system default.
     pub fn start(stop_flag: Arc<AtomicBool>, device: Option<&cpal::Device>) -> Result<Self> {
-        let (mic_tx, mic_rx) = mpsc::channel::<Vec<f32>>();
-        let (spk_tx, spk_rx) = mpsc::channel::<Vec<f32>>();
-
-        let (mic_stream, mic_rate) = start_mic(mic_tx, device)?;
-        let (spk_capture, spk_rate) = start_speaker(spk_tx)?;
+        let (mic_stream, mic_rate, mic_consumer) = start_mic(device)?;
+        let (spk_capture, spk_rate, spk_consumer) = start_speaker()?;
 
         eprintln!(
             "Recording (mic {}Hz, speaker {}Hz)...",
@@ -68,19 +53,13 @@ impl RecorderHandle {
             );
         }
 
+        let mic_stop = stop_flag.clone();
         let mic_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            while let Ok(chunk) = mic_rx.recv() {
-                buf.extend(chunk);
-            }
-            buf
+            drain_ring_buffer(mic_consumer, &mic_stop)
         });
+        let spk_stop = stop_flag.clone();
         let spk_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            while let Ok(chunk) = spk_rx.recv() {
-                buf.extend(chunk);
-            }
-            buf
+            drain_ring_buffer(spk_consumer, &spk_stop)
         });
 
         Ok(Self {
@@ -157,9 +136,31 @@ pub fn default_input_device_name() -> Option<String> {
     host.default_input_device().and_then(|d| d.name().ok())
 }
 
+// --- Shared consumer drain ---
+
+/// Drain a ring buffer consumer into a Vec until the stop flag is set,
+/// then do one final drain to pick up any remaining samples.
+fn drain_ring_buffer(mut consumer: rtrb::Consumer<f32>, stop: &AtomicBool) -> Vec<f32> {
+    let mut buf = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(sample) = consumer.pop() {
+            buf.push(sample);
+        }
+        std::thread::sleep(DRAIN_INTERVAL);
+    }
+    // Final drain after stop — the audio callback may have pushed more samples
+    // between our last pop and the stream being dropped.
+    while let Ok(sample) = consumer.pop() {
+        buf.push(sample);
+    }
+    buf
+}
+
 // --- Mic capture (cpal) ---
 
-fn start_mic(tx: mpsc::Sender<Vec<f32>>, device: Option<&cpal::Device>) -> Result<(cpal::Stream, u32)> {
+fn start_mic(
+    device: Option<&cpal::Device>,
+) -> Result<(cpal::Stream, u32, rtrb::Consumer<f32>)> {
     let host = cpal::default_host();
     let default_device;
     let device = match device {
@@ -174,32 +175,33 @@ fn start_mic(tx: mpsc::Sender<Vec<f32>>, device: Option<&cpal::Device>) -> Resul
     let channels = config.channels() as usize;
     let format = config.sample_format();
 
+    let capacity = rate as usize * RING_BUF_SECONDS;
+    let (producer, consumer) = rtrb::RingBuffer::new(capacity);
+
     let stream = match format {
-        cpal::SampleFormat::F32 => build_mic_stream::<f32>(device, &config, tx, channels)?,
-        cpal::SampleFormat::I16 => build_mic_stream::<i16>(device, &config, tx, channels)?,
-        cpal::SampleFormat::I32 => build_mic_stream::<i32>(device, &config, tx, channels)?,
+        cpal::SampleFormat::F32 => build_mic_stream::<f32>(device, &config, producer, channels)?,
+        cpal::SampleFormat::I16 => build_mic_stream::<i16>(device, &config, producer, channels)?,
+        cpal::SampleFormat::I32 => build_mic_stream::<i32>(device, &config, producer, channels)?,
         _ => bail!("unsupported mic format: {:?}", format),
     };
     stream.play()?;
 
-    Ok((stream, rate))
+    Ok((stream, rate, consumer))
 }
 
 fn build_mic_stream<S: SizedSample + ToSample<f32> + Send + 'static>(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
-    tx: mpsc::Sender<Vec<f32>>,
+    mut producer: rtrb::Producer<f32>,
     channels: usize,
 ) -> Result<cpal::Stream> {
     Ok(device.build_input_stream(
         &config.config(),
         move |data: &[S], _: &_| {
-            let mono: Vec<f32> = data
-                .iter()
-                .step_by(channels)
-                .map(|&s| (s.to_sample::<f32>() * MIC_GAIN).clamp(-1.0, 1.0))
-                .collect();
-            let _ = tx.send(mono);
+            for sample in data.iter().step_by(channels) {
+                let s = (sample.to_sample::<f32>() * MIC_GAIN).clamp(-1.0, 1.0);
+                let _ = producer.push(s); // lock-free; drops sample if full
+            }
         },
         |err| eprintln!("mic error: {err}"),
         None,
@@ -217,12 +219,12 @@ struct SpeakerCapture {
 
 #[cfg(target_os = "macos")]
 struct SpeakerCtx {
-    tx: mpsc::Sender<Vec<f32>>,
+    producer: rtrb::Producer<f32>,
     format: arc::R<av::AudioFormat>,
 }
 
 #[cfg(target_os = "macos")]
-fn start_speaker(tx: mpsc::Sender<Vec<f32>>) -> Result<(SpeakerCapture, u32)> {
+fn start_speaker() -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
     use ca::aggregate_device_keys as agg_keys;
 
     let tap_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&ns::Array::new());
@@ -230,6 +232,9 @@ fn start_speaker(tx: mpsc::Sender<Vec<f32>>) -> Result<(SpeakerCapture, u32)> {
     let asbd = tap.asbd()?;
     let rate = asbd.sample_rate as u32;
     let format = av::AudioFormat::with_asbd(&asbd).context("bad audio format from tap")?;
+
+    let capacity = rate as usize * RING_BUF_SECONDS;
+    let (producer, consumer) = rtrb::RingBuffer::new(capacity);
 
     let sub_tap = cf::DictionaryOf::with_keys_values(
         &[ca::sub_device_keys::uid()],
@@ -252,7 +257,7 @@ fn start_speaker(tx: mpsc::Sender<Vec<f32>>) -> Result<(SpeakerCapture, u32)> {
         ],
     );
 
-    let mut ctx = Box::new(SpeakerCtx { tx, format });
+    let mut ctx = Box::new(SpeakerCtx { producer, format });
 
     let agg_device = ca::AggregateDevice::with_desc(&agg_desc)
         .map_err(|e| anyhow::anyhow!("AggregateDevice::with_desc failed: {}", e))?;
@@ -269,6 +274,7 @@ fn start_speaker(tx: mpsc::Sender<Vec<f32>>) -> Result<(SpeakerCapture, u32)> {
             _tap: tap,
         },
         rate,
+        consumer,
     ))
 }
 
@@ -287,7 +293,9 @@ extern "C" fn speaker_io_proc(
     // Try typed PCM buffer first
     if let Some(view) = av::AudioPcmBuf::with_buf_list_no_copy(&ctx.format, input_data, None) {
         if let Some(data) = view.data_f32_at(0) {
-            let _ = ctx.tx.send(data.to_vec());
+            for &s in data {
+                let _ = ctx.producer.push(s);
+            }
             return os::Status::NO_ERR;
         }
     }
@@ -298,7 +306,9 @@ extern "C" fn speaker_io_proc(
         let count = buf.data_bytes_size as usize / std::mem::size_of::<f32>();
         if count > 0 {
             let data = unsafe { std::slice::from_raw_parts(buf.data as *const f32, count) };
-            let _ = ctx.tx.send(data.to_vec());
+            for &s in data {
+                let _ = ctx.producer.push(s);
+            }
         }
     }
 
@@ -309,6 +319,6 @@ extern "C" fn speaker_io_proc(
 struct SpeakerCapture;
 
 #[cfg(not(target_os = "macos"))]
-fn start_speaker(_tx: mpsc::Sender<Vec<f32>>) -> Result<(SpeakerCapture, u32)> {
+fn start_speaker() -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
     bail!("System audio capture is only supported on macOS")
 }

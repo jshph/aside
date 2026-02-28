@@ -2,6 +2,8 @@
 
 A meeting capture tool that lives inside your Obsidian vault. Record, take timestamped notes, transcribe locally, and distill into vault-connected artifacts — all without leaving the workflow you already have.
 
+![aside demo](assets/demo.gif)
+
 ## Why this exists
 
 There are good meeting tools out there. [Granola](https://granola.ai) enriches your notes with transcript context. [Hyprnote](https://github.com/fastrepl/hyprnote) is a fast, open-source Tauri app with local transcription and a plugin system. Both are polished products.

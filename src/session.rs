@@ -10,6 +10,8 @@ pub struct SessionMeta {
     pub notes_path: String,
     pub created_at: String,
     pub segments: Vec<SegmentMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault_note_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,6 +53,7 @@ pub fn create_session(
         notes_path: notes_path.to_string(),
         created_at: now,
         segments: Vec::new(),
+        vault_note_path: None,
     };
     write_meta(dir, &meta)
 }
@@ -141,4 +144,14 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<SessionInfo>> {
 
     sessions.sort_by(|a, b| b.start_time.cmp(&a.start_time));
     Ok(sessions)
+}
+
+pub fn get_session_meta(dir: &Path, name: &str) -> Result<SessionMeta> {
+    read_meta(dir, name)
+}
+
+pub fn set_vault_note_path(dir: &Path, name: &str, vault_path: &str) -> Result<()> {
+    let mut meta = read_meta(dir, name)?;
+    meta.vault_note_path = Some(vault_path.to_string());
+    write_meta(dir, &meta)
 }

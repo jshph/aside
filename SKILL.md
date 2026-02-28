@@ -56,10 +56,7 @@ $ARGUMENTS = "standup --align-only"
    [01:30 ~02:15] revisited auth approach — decided on JWT
    [05:00] action item: draft RFC by Friday
    ```
-2. Query the session database for segment info:
-   ```bash
-   sqlite3 .aside/.aside.db "SELECT segment_index, wav_path, offset_ms, duration_secs FROM segments WHERE session_name = '<session-name>' ORDER BY segment_index"
-   ```
+2. Read `.aside/<session-name>.meta.json` for segment info (`segment_index`, `wav_path`, `offset_ms`, `duration_secs`) and `vault_note_path` (if the session was published to the vault on quit).
 3. List WAV segments: `.aside/<session-name>_seg*.wav`
 
 If the memo file doesn't exist, ask the user for the correct session name.
@@ -275,16 +272,19 @@ Apply revisions if requested. Iterate until the user is satisfied.
 
 Once approved:
 
-1. Create the note via `./scripts/new-note.sh` (run from `$OBSIDIAN_VAULT/`)
-2. Populate with the approved content using the Edit tool
+1. **If `vault_note_path` exists in session metadata** (from Step 1): the note was already created on session quit. Read the existing vault note, replace everything after frontmatter with the approved distilled content, and update frontmatter `tags`/`people` fields from Enzyme results.
+2. **If `vault_note_path` is absent**: fall back to creating the note via `./scripts/new-note.sh` (run from `$OBSIDIAN_VAULT/`), then populate with the approved content using the Edit tool.
 3. Rename with a descriptive suffix following vault naming conventions:
    - Keep timestamp prefix
    - Add 3-7 word descriptive name, lowercase
    - Pattern for conversations: `[timestamp] chat with [person] about [topic].md`
 
 ```bash
-mv "$OBSIDIAN_VAULT/inbox/[timestamp].md" "$OBSIDIAN_VAULT/inbox/[timestamp] [descriptive name].md"
+mv "$OBSIDIAN_VAULT/inbox/[old-filename].md" "$OBSIDIAN_VAULT/inbox/[old-filename-prefix] [descriptive name].md"
 ```
+
+4. After any rename, update `vault_note_path` in the session metadata:
+   - Read `.aside/<session-name>.meta.json`, set `vault_note_path` to the new path, write back.
 
 ---
 

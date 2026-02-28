@@ -1,5 +1,6 @@
 mod app;
 mod parser;
+mod publish;
 mod recorder;
 mod session;
 mod text_helpers;
@@ -210,7 +211,31 @@ fn run_with_recorder(
         session::update_segment_duration(&dir, session_name, segment_index, duration)?;
 
         match tui_result {
-            Ok(tui::TuiAction::Quit) => return Ok(()),
+            Ok(tui::TuiAction::Quit) => {
+                let memo = app.export();
+                if !memo.trim().is_empty() {
+                    let total_dur: f64 = session::get_session_meta(&dir, session_name)?
+                        .segments
+                        .iter()
+                        .filter_map(|s| s.duration_secs)
+                        .sum();
+                    match publish::publish_to_vault(
+                        &dir,
+                        session_name,
+                        &memo,
+                        &app.start_time,
+                        total_dur,
+                    ) {
+                        Ok(Some(vault_path)) => {
+                            session::set_vault_note_path(&dir, session_name, &vault_path)?;
+                            eprintln!("Published to vault: {}", vault_path);
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("Warning: vault publish failed: {}", e),
+                    }
+                }
+                return Ok(());
+            }
             Ok(tui::TuiAction::SwitchDevice(idx)) => {
                 // Re-enumerate devices to get the actual cpal::Device
                 let mut devices = recorder::list_input_devices();

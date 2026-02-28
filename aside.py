@@ -111,6 +111,8 @@ def transcribe_channel(audio_path: str, channel: int, model: str) -> list[dict]:
         path_or_hf_repo=model,
         word_timestamps=True,
         language="en",
+        hallucination_silence_threshold=2.0,
+        condition_on_previous_text=False,
     )
 
     words = []
@@ -131,6 +133,14 @@ def transcribe_channel(audio_path: str, channel: int, model: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+SILENCE_HALLUCINATION_RE = re.compile(
+    r"^\s*(thank\s+you\.?|thanks\s+for\s+watching\.?|please\s+subscribe\.?"
+    r"|see\s+you\s+(next\s+time|in\s+the\s+next)\.?|bye[\s.!]*"
+    r"|you\.?|\.+)\s*$",
+    re.IGNORECASE,
+)
+
+
 def _remove_hallucinations(words: list[dict]) -> list[dict]:
     """Remove OpenOpen-style hallucination words (but keep real words like OpenClaw)."""
     out = []
@@ -140,6 +150,16 @@ def _remove_hallucinations(words: list[dict]) -> list[dict]:
             continue
         out.append(w)
     return out
+
+
+def _remove_silence_hallucinations(entries: list[dict]) -> list[dict]:
+    """Remove phrases that are classic Whisper silence hallucinations.
+
+    Whisper hallucinates short phrases like 'Thank you.' or 'Thanks for
+    watching.' when processing quiet/silent audio.  These are caught at the
+    phrase level after word merging so multi-word hallucinations are matched.
+    """
+    return [e for e in entries if not SILENCE_HALLUCINATION_RE.match(e["text"].strip())]
 
 
 def _clean_exclamation_artifacts(words: list[dict]) -> list[dict]:
@@ -379,6 +399,7 @@ def cleanup(words: list[dict], keep_backchannels: bool = False) -> list[dict]:
 
     # Merge words into phrases
     entries = _merge_words_to_phrases(words, gap_ms=2000)
+    entries = _remove_silence_hallucinations(entries)
 
     if keep_backchannels:
         return _merge_same_channel(entries, gap_ms=3000)

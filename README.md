@@ -1,27 +1,33 @@
 # aside
 
-![aside demo](assets/demo.gif)
-
-Record meetings with a timestamped notepad running alongside. Then turn the recording + your notes into a vault-connected artifact that beats what the transcript can do alone.
+A meeting capture tool that lives inside your Obsidian vault. Record, take timestamped notes, transcribe locally, and distill into vault-connected artifacts — all without leaving the workflow you already have.
 
 ## Why this exists
 
-Transcripts are noisy. They capture everything said but nothing about what mattered. Meeting notes are the opposite — they capture what you noticed, but miss the surrounding context. And neither one connects back to the thinking you've already done.
+There are good meeting tools out there. [Granola](https://granola.ai) enriches your notes with transcript context. [Hyprnote](https://github.com/fastrepl/hyprnote) is a fast, open-source Tauri app with local transcription and a plugin system. Both are polished products.
 
-Aside fixes all three problems. It merges your real-time notes with the transcript on a shared timeline — your note at `[05:12] action item: draft RFC` gets interleaved with what was actually being discussed at 5:12. Then a Claude Code skill searches your Obsidian vault for related thinking, surfaces connections you wouldn't have made manually, and distills everything into a structured note with `[[wikilinks]]` woven in.
-
-The transcript fills in what you didn't write down. Your notes tell the transcript what to foreground. And your vault gives the whole thing context that no recording app has access to.
+Aside is for people who don't want another app. If you already live in Obsidian and a terminal, aside slots into that workflow — no new window, no account, no integration to configure. It stores sessions inside your vault, transcribes locally, and uses a Claude Code skill to search your existing notes during distillation. The output is a vault note with `[[wikilinks]]`, not a document you have to move somewhere.
 
 Born from two years of the same Obsidian workflow: record, take sparse notes, transcribe, manually stitch the two together, then hunt through old notes for connections. This automates all of it.
+
+## What makes it different
+
+**Vault-native.** Clone it into your Obsidian vault or point it at one. Sessions, recordings, and metadata live in `.aside/`. The distillation output is a vault note, not an export. No sync, no import step — it's already where your thinking lives.
+
+**Your vault is the context window.** Every meeting app can transcribe. None of them know what you've been thinking about for the past two years. Aside's skill searches your vault during distillation — grepping for concrete anchors, running semantic search against your own writing — and weaves those connections into the final note. The meeting doesn't exist in isolation; it lands in the middle of your existing work.
+
+**AI-native where it matters.** The intelligence isn't compiled into the app. The distillation step is a Claude Code skill — a plain markdown file ([`SKILL.md`](SKILL.md)) that teaches Claude how to use your vault as context. You can read it, edit it, swap the template. The skill orchestrates [Enzyme](https://github.com/jmpaz/enzyme) search, transcript analysis, and note generation in natural language. No black-box features, no plugin system to learn.
+
+**5 MB binary, ~2,900 lines of code.** A Rust binary for capture, a Python script for transcription cleanup, and a markdown skill file for distillation. Small enough to read the entire codebase in an afternoon, fork it, and make it yours.
+
+**Fully local.** Recording, transcription (whisper.cpp), and storage all happen on your machine. The only network call is the LLM for distillation, and that's through Claude Code — your existing setup, your API key.
 
 ## What it does
 
 1. **Records** stereo audio (mic + system audio) while you type timestamped notes in a terminal editor
-2. **Transcribes** via whisper.cpp with multi-pass cleanup (hallucination removal, dedup, filler stripping)
+2. **Transcribes** locally via whisper.cpp with multi-pass cleanup (hallucination removal, dedup, filler stripping)
 3. **Aligns** transcript and memo on a shared timeline
 4. **Distills** into a structured vault note with connections to your existing notes via [Enzyme](https://github.com/jmpaz/enzyme)
-
-Steps 1 is the Rust binary. Steps 2–4 are a Python script + Claude Code skill.
 
 ## Install
 
@@ -55,17 +61,19 @@ Keybindings: `Ctrl+D` switch mic, `Ctrl+S` save, `Ctrl+C` quit and save.
 
 On quit, the memo is published to your Obsidian vault if `.aside/config.toml` is configured.
 
-### Transcribe + align
+### Transcribe + distill
 
-```bash
-python3 aside.py .aside/standup_seg0.wav --output .aside/
-```
-
-Or use the `/aside` Claude Code skill for the full pipeline:
+Use the `/aside` Claude Code skill for the full pipeline:
 
 ```
 /aside standup              # transcribe → align → distill → vault note
 /aside standup --align-only # just transcribe and align, no distillation
+```
+
+Or run transcription standalone:
+
+```bash
+python3 aside.py .aside/standup_seg0.wav --output .aside/
 ```
 
 ## Vault integration
@@ -84,18 +92,19 @@ A template at `.aside/template.md` controls the note format. Variables: `{{name}
 
 ## How it works
 
-**Recording**: The Rust binary captures mic audio via cpal and system audio via Core Audio tap, writing 48kHz stereo WAV. You can switch mic devices mid-session — each device switch creates a new audio segment with proper timeline offsets.
+**Recording**: Rust binary captures mic audio via cpal and system audio via Core Audio tap, writing 48kHz stereo WAV. Switch mic devices mid-session with `Ctrl+D` — each switch creates a new audio segment with proper timeline offsets.
 
-**Transcription**: `aside.py` splits stereo into mono channels, transcribes each with `whisper-cli`, then runs cleanup passes: hallucination removal, consecutive word dedup, backchannel/filler stripping, and gap-based phrase merging. Outputs Hyprnote-format JSON.
+**Transcription**: `aside.py` splits stereo into mono channels, transcribes each with `whisper-cli`, then runs cleanup passes: hallucination removal, consecutive word dedup, backchannel/filler stripping, and gap-based phrase merging.
 
-**Alignment**: The `/aside` skill interleaves transcript segments with memo lines on a shared millisecond timeline. Memo lines act as attention signals — they tell the distillation step what the meeting participant thought was worth writing down in the moment.
+**Alignment**: The `/aside` skill interleaves transcript segments with memo lines on a shared millisecond timeline. Memo lines act as attention signals — they tell the distillation step what was worth writing down in the moment.
 
-**Distillation**: Searches the Obsidian vault via Enzyme for connections to the meeting content, weighted by what the memo flagged. Produces a structured note with `[[wikilinks]]` to existing thinking.
+**Distillation**: The skill explores your vault via Enzyme — trending entities, semantic search, grep for concrete anchors — then drafts a structured note weighted by what your memo flagged. Connections you'd never search for manually show up as `[[wikilinks]]` in the final output.
 
 ## Project structure
 
 ```
-aside.py            Transcription + cleanup pipeline
+aside.py            Transcription + cleanup pipeline (600 lines)
+SKILL.md            Claude Code skill — the distillation brain (300 lines)
 src/
   main.rs           CLI and session orchestration
   recorder.rs       Stereo audio capture (mic + system)
@@ -105,7 +114,6 @@ src/
   publish.rs        Vault note creation on session end
   parser.rs         Markdown ↔ editor round-tripping
   text_helpers.rs   Word/char boundary helpers
-SKILL.md            Claude Code skill for the full pipeline
 ```
 
 Sessions are stored in `.aside/` as WAV segments + JSON metadata + markdown memo.

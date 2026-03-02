@@ -18,7 +18,7 @@ Born from two years of the same Obsidian workflow: record, take sparse notes, tr
 
 **Your vault is the context window.** Every meeting app can transcribe. None of them know what you've been thinking about for the past two years. Aside's skill searches your vault during distillation — grepping for concrete anchors, running semantic search against your own writing — and weaves those connections into the final note. The meeting doesn't exist in isolation; it lands in the middle of your existing work.
 
-**AI-native where it matters.** The intelligence isn't compiled into the app. The distillation step is a Claude Code skill — a plain markdown file ([`SKILL.md`](SKILL.md)) that teaches Claude how to use your vault as context. You can read it, edit it, swap the template. The skill orchestrates [Enzyme](https://github.com/jmpaz/enzyme) search, transcript analysis, and note generation in natural language. No black-box features, no plugin system to learn.
+**AI-native where it matters.** The intelligence isn't compiled into the app. The distillation step is a Claude Code skill — a plain markdown file ([`SKILL.md`](SKILL.md)) that teaches Claude how to use your vault as context. You can read it, edit it, swap the template. The skill orchestrates [Enzyme](https://enzyme.garden) search, transcript analysis, and note generation in natural language. No black-box features, no plugin system to learn.
 
 **5 MB binary, ~3,100 lines of code.** A Rust binary for capture, a Python script for transcription cleanup, and a markdown skill file for distillation. Small enough to read the entire codebase in an afternoon, fork it, and make it yours.
 
@@ -29,7 +29,7 @@ Born from two years of the same Obsidian workflow: record, take sparse notes, tr
 1. **Records** stereo audio (mic + system audio) while you type timestamped notes in a terminal editor
 2. **Transcribes** locally via whisper.cpp with multi-pass cleanup (hallucination removal, dedup, filler stripping)
 3. **Aligns** transcript and memo on a shared timeline
-4. **Distills** into a structured vault note with connections to your existing notes via [Enzyme](https://github.com/jmpaz/enzyme)
+4. **Distills** into a structured vault note with connections to your existing notes via [Enzyme](https://enzyme.garden)
 
 ## Install
 

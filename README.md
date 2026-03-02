@@ -20,7 +20,7 @@ Born from two years of the same Obsidian workflow: record, take sparse notes, tr
 
 **AI-native where it matters.** The intelligence isn't compiled into the app. The distillation step is a Claude Code skill — a plain markdown file ([`SKILL.md`](SKILL.md)) that teaches Claude how to use your vault as context. You can read it, edit it, swap the template. The skill orchestrates [Enzyme](https://github.com/jmpaz/enzyme) search, transcript analysis, and note generation in natural language. No black-box features, no plugin system to learn.
 
-**5 MB binary, ~2,900 lines of code.** A Rust binary for capture, a Python script for transcription cleanup, and a markdown skill file for distillation. Small enough to read the entire codebase in an afternoon, fork it, and make it yours.
+**5 MB binary, ~3,100 lines of code.** A Rust binary for capture, a Python script for transcription cleanup, and a markdown skill file for distillation. Small enough to read the entire codebase in an afternoon, fork it, and make it yours.
 
 **Fully local.** Recording, transcription (whisper.cpp), and storage all happen on your machine. The only network call is the LLM for distillation, and that's through Claude Code — your existing setup, your API key.
 
@@ -75,7 +75,7 @@ Use the `/aside` Claude Code skill for the full pipeline:
 Or run transcription standalone:
 
 ```bash
-python3 aside.py .aside/standup_seg0.wav --output .aside/
+python3 aside.py transcribe .aside/standup_seg0.wav --output .aside/
 ```
 
 ## Vault integration
@@ -98,14 +98,14 @@ A template at `.aside/template.md` controls the note format. Variables: `{{name}
 
 **Transcription**: `aside.py` splits stereo into mono channels, transcribes each with `whisper-cli`, then runs cleanup passes: hallucination removal, consecutive word dedup, backchannel/filler stripping, and gap-based phrase merging.
 
-**Alignment**: The `/aside` skill interleaves transcript segments with memo lines on a shared millisecond timeline. Memo lines act as attention signals — they tell the distillation step what was worth writing down in the moment.
+**Alignment**: `aside.py align` interleaves transcript segments with memo lines on a shared millisecond timeline, grouping them into windows. Memo lines act as attention signals — they tell the distillation step what was worth writing down in the moment.
 
 **Distillation**: The skill explores your vault via Enzyme — trending entities, semantic search, grep for concrete anchors — then drafts a structured note weighted by what your memo flagged. Connections you'd never search for manually show up as `[[wikilinks]]` in the final output.
 
 ## Project structure
 
 ```
-aside.py            Transcription + cleanup pipeline (600 lines)
+aside.py            Transcription, cleanup, and alignment (875 lines)
 SKILL.md            Claude Code skill — the distillation brain (300 lines)
 src/
   main.rs           CLI and session orchestration
@@ -119,3 +119,7 @@ src/
 ```
 
 Sessions are stored in `.aside/` as WAV segments + JSON metadata + markdown memo.
+
+## License
+
+[GPLv3](LICENSE)

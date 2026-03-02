@@ -278,16 +278,18 @@ fn render(f: &mut ratatui::Frame, app: &mut App) {
         format!("{:02}:{:02}", elapsed / 60, elapsed % 60)
     };
 
-    let mic_display = truncate_mic_name(&app.current_mic_name, 24);
+    let mic_peak = app.mic_level.swap(0, Ordering::Relaxed);
+    let spk_peak = app.spk_level.swap(0, Ordering::Relaxed);
 
     let status_text = if let Some(ref msg) = app.message {
         format!(" {} | {}", time, msg)
     } else {
         format!(
-            " {} | {} lines | mic: {} | ^D device  ^S save  ^C quit",
+            " {} | {} lines | mic {} spk {} | ^D device  ^S save  ^C quit",
             time,
             app.lines.len(),
-            mic_display,
+            level_meter(mic_peak, 6),
+            level_meter(spk_peak, 6),
         )
     };
 
@@ -351,10 +353,14 @@ fn render_device_overlay(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(paragraph, overlay_area);
 }
 
-fn truncate_mic_name(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len {
-        name.to_string()
-    } else {
-        format!("{}…", &name[..max_len - 1])
+fn level_meter(peak_bits: u32, width: usize) -> String {
+    let peak = f32::from_bits(peak_bits);
+    if peak <= 0.0 {
+        return "░".repeat(width);
     }
+    let db = 20.0 * peak.log10();
+    // Map -48 dB .. 0 dB onto 0 .. width bars
+    let normalized = ((db + 48.0) / 48.0).clamp(0.0, 1.0);
+    let filled = (normalized * width as f32).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }

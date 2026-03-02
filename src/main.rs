@@ -203,6 +203,9 @@ fn run_with_recorder(
         let recorder =
             recorder::RecorderHandle::start(stop_flag.clone(), current_device.as_ref())?;
 
+        app.mic_level = recorder.mic_peak();
+        app.spk_level = recorder.spk_peak();
+
         let tui_result = tui::run_tui(app, stop_flag.clone());
 
         // TUI has exited, stop_flag is set. Now finalize recording.

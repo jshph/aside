@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SizedSample;
 use dasp::sample::ToSample;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,14 +33,19 @@ pub struct RecorderHandle {
     _spk_capture: SpeakerCapture,
     sample_rate: u32,
     spk_rate: u32,
+    mic_peak: Arc<AtomicU32>,
+    spk_peak: Arc<AtomicU32>,
 }
 
 impl RecorderHandle {
     /// Start capturing mic + system audio. Returns immediately.
     /// If `device` is `Some`, uses that mic; otherwise uses the system default.
     pub fn start(stop_flag: Arc<AtomicBool>, device: Option<&cpal::Device>) -> Result<Self> {
-        let (mic_stream, mic_rate, mic_consumer) = start_mic(device)?;
-        let (spk_capture, spk_rate, spk_consumer) = start_speaker()?;
+        let mic_peak = Arc::new(AtomicU32::new(0));
+        let spk_peak = Arc::new(AtomicU32::new(0));
+
+        let (mic_stream, mic_rate, mic_consumer) = start_mic(device, mic_peak.clone())?;
+        let (spk_capture, spk_rate, spk_consumer) = start_speaker(spk_peak.clone())?;
 
         eprintln!(
             "Recording (mic {}Hz, speaker {}Hz)...",
@@ -71,7 +76,17 @@ impl RecorderHandle {
             _spk_capture: spk_capture,
             sample_rate: mic_rate,
             spk_rate,
+            mic_peak,
+            spk_peak,
         })
+    }
+
+    pub fn mic_peak(&self) -> Arc<AtomicU32> {
+        self.mic_peak.clone()
+    }
+
+    pub fn spk_peak(&self) -> Arc<AtomicU32> {
+        self.spk_peak.clone()
     }
 
     /// Stop recording and write WAV to `path`. Returns duration in seconds.
@@ -91,7 +106,10 @@ impl RecorderHandle {
             return Ok(0.0);
         }
 
-        // Resample speaker to mic rate if they differ
+        // Resample speaker to mic rate if they differ. Typical case:
+        // mic=24kHz, macOS system audio tap=48kHz. The output WAV uses the
+        // mic rate — 24kHz is above whisper's 16kHz so no speech information
+        // is lost when the transcription pipeline (aside.py) downsamples.
         let spk_samples = if self.spk_rate != self.sample_rate {
             resample(&spk_samples, self.spk_rate, self.sample_rate)
         } else {
@@ -147,7 +165,8 @@ pub fn default_input_device_name() -> Option<String> {
 
 // --- Resampling ---
 
-/// Resample audio via linear interpolation.
+/// Resample audio via linear interpolation. Good enough for speech destined
+/// for whisper-cli, which resamples everything to 16kHz internally anyway.
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || samples.is_empty() {
         return samples.to_vec();
@@ -195,6 +214,7 @@ fn drain_ring_buffer(mut consumer: rtrb::Consumer<f32>, stop: &AtomicBool) -> Ve
 
 fn start_mic(
     device: Option<&cpal::Device>,
+    peak: Arc<AtomicU32>,
 ) -> Result<(cpal::Stream, u32, rtrb::Consumer<f32>)> {
     let host = cpal::default_host();
     let default_device;
@@ -214,9 +234,9 @@ fn start_mic(
     let (producer, consumer) = rtrb::RingBuffer::new(capacity);
 
     let stream = match format {
-        cpal::SampleFormat::F32 => build_mic_stream::<f32>(device, &config, producer, channels)?,
-        cpal::SampleFormat::I16 => build_mic_stream::<i16>(device, &config, producer, channels)?,
-        cpal::SampleFormat::I32 => build_mic_stream::<i32>(device, &config, producer, channels)?,
+        cpal::SampleFormat::F32 => build_mic_stream::<f32>(device, &config, producer, channels, peak)?,
+        cpal::SampleFormat::I16 => build_mic_stream::<i16>(device, &config, producer, channels, peak)?,
+        cpal::SampleFormat::I32 => build_mic_stream::<i32>(device, &config, producer, channels, peak)?,
         _ => bail!("unsupported mic format: {:?}", format),
     };
     stream.play()?;
@@ -229,12 +249,14 @@ fn build_mic_stream<S: SizedSample + ToSample<f32> + Send + 'static>(
     config: &cpal::SupportedStreamConfig,
     mut producer: rtrb::Producer<f32>,
     channels: usize,
+    peak: Arc<AtomicU32>,
 ) -> Result<cpal::Stream> {
     Ok(device.build_input_stream(
         &config.config(),
         move |data: &[S], _: &_| {
             for sample in data.iter().step_by(channels) {
                 let s = (sample.to_sample::<f32>() * MIC_GAIN).clamp(-1.0, 1.0);
+                peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
                 let _ = producer.push(s); // lock-free; drops sample if full
             }
         },
@@ -256,10 +278,11 @@ struct SpeakerCapture {
 struct SpeakerCtx {
     producer: rtrb::Producer<f32>,
     format: arc::R<av::AudioFormat>,
+    peak: Arc<AtomicU32>,
 }
 
 #[cfg(target_os = "macos")]
-fn start_speaker() -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
+fn start_speaker(peak: Arc<AtomicU32>) -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
     use ca::aggregate_device_keys as agg_keys;
 
     let tap_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&ns::Array::new());
@@ -292,7 +315,7 @@ fn start_speaker() -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
         ],
     );
 
-    let mut ctx = Box::new(SpeakerCtx { producer, format });
+    let mut ctx = Box::new(SpeakerCtx { producer, format, peak });
 
     let agg_device = ca::AggregateDevice::with_desc(&agg_desc)
         .map_err(|e| anyhow::anyhow!("AggregateDevice::with_desc failed: {}", e))?;
@@ -329,6 +352,7 @@ extern "C" fn speaker_io_proc(
     if let Some(view) = av::AudioPcmBuf::with_buf_list_no_copy(&ctx.format, input_data, None) {
         if let Some(data) = view.data_f32_at(0) {
             for &s in data {
+                ctx.peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
                 let _ = ctx.producer.push(s);
             }
             return os::Status::NO_ERR;
@@ -342,6 +366,7 @@ extern "C" fn speaker_io_proc(
         if count > 0 {
             let data = unsafe { std::slice::from_raw_parts(buf.data as *const f32, count) };
             for &s in data {
+                ctx.peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
                 let _ = ctx.producer.push(s);
             }
         }
@@ -354,6 +379,6 @@ extern "C" fn speaker_io_proc(
 struct SpeakerCapture;
 
 #[cfg(not(target_os = "macos"))]
-fn start_speaker() -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
+fn start_speaker(_peak: Arc<AtomicU32>) -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
     bail!("System audio capture is only supported on macOS")
 }

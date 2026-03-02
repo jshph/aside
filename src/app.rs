@@ -1,6 +1,8 @@
 use chrono::{DateTime, Local};
 use ratatui::layout::Rect;
 use std::io;
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
 use crate::parser::ParsedLine;
 use crate::text_helpers::*;
@@ -31,6 +33,8 @@ pub struct App {
     pub devices: Vec<String>,
     pub selected_device: usize,
     pub current_mic_name: String,
+    pub mic_level: Arc<AtomicU32>,
+    pub spk_level: Arc<AtomicU32>,
 }
 
 impl App {
@@ -51,6 +55,8 @@ impl App {
             devices: Vec::new(),
             selected_device: 0,
             current_mic_name: mic_name,
+            mic_level: Arc::new(AtomicU32::new(0)),
+            spk_level: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -97,6 +103,8 @@ impl App {
             devices: Vec::new(),
             selected_device: 0,
             current_mic_name: mic_name,
+            mic_level: Arc::new(AtomicU32::new(0)),
+            spk_level: Arc::new(AtomicU32::new(0)),
         }
     }
 

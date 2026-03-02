@@ -32,6 +32,7 @@ pub struct RecorderHandle {
     _mic_stream: cpal::Stream,
     _spk_capture: SpeakerCapture,
     sample_rate: u32,
+    spk_rate: u32,
 }
 
 impl RecorderHandle {
@@ -69,6 +70,7 @@ impl RecorderHandle {
             _mic_stream: mic_stream,
             _spk_capture: spk_capture,
             sample_rate: mic_rate,
+            spk_rate,
         })
     }
 
@@ -88,6 +90,13 @@ impl RecorderHandle {
             eprintln!("No audio captured.");
             return Ok(0.0);
         }
+
+        // Resample speaker to mic rate if they differ
+        let spk_samples = if self.spk_rate != self.sample_rate {
+            resample(&spk_samples, self.spk_rate, self.sample_rate)
+        } else {
+            spk_samples
+        };
 
         let spec = hound::WavSpec {
             channels: 2,
@@ -134,6 +143,32 @@ pub fn list_input_devices() -> Vec<(String, cpal::Device)> {
 pub fn default_input_device_name() -> Option<String> {
     let host = cpal::default_host();
     host.default_input_device().and_then(|d| d.name().ok())
+}
+
+// --- Resampling ---
+
+/// Resample audio via linear interpolation.
+fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_len = (samples.len() as f64 / ratio).ceil() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        let s = if idx + 1 < samples.len() {
+            samples[idx] * (1.0 - frac) + samples[idx + 1] * frac
+        } else if idx < samples.len() {
+            samples[idx]
+        } else {
+            0.0
+        };
+        out.push(s);
+    }
+    out
 }
 
 // --- Shared consumer drain ---

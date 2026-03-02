@@ -288,8 +288,8 @@ fn render(f: &mut ratatui::Frame, app: &mut App) {
             " {} | {} lines | mic {} spk {} | ^D device  ^S save  ^C quit",
             time,
             app.lines.len(),
-            level_meter(mic_peak, 6),
-            level_meter(spk_peak, 6),
+            level_meter(mic_peak, 8),
+            level_meter(spk_peak, 8),
         )
     };
 
@@ -359,8 +359,8 @@ fn level_meter(peak_bits: u32, width: usize) -> String {
         return "░".repeat(width);
     }
     let db = 20.0 * peak.log10();
-    // Map -48 dB .. 0 dB onto 0 .. width bars
-    let normalized = ((db + 48.0) / 48.0).clamp(0.0, 1.0);
+    // Map -72 dB .. 0 dB onto 0 .. width bars
+    let normalized = ((db + 72.0) / 72.0).clamp(0.0, 1.0);
     let filled = (normalized * width as f32).round() as usize;
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }

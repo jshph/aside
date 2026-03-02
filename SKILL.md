@@ -70,101 +70,26 @@ If the memo file doesn't exist, ask the user for the correct session name.
 
 For each WAV segment, run:
 ```bash
-python3 aside.py ".aside/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
+python3 aside.py transcribe ".aside/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
 ```
 
 This produces a JSON file with `transcripts[0].words[]`, each entry containing `start_ms`, `end_ms`, `text`, and `channel`.
 
 When there are multiple segments (from device switches), adjust transcript timestamps by each segment's `offset_ms` from the database so they align to the session's global timeline.
 
-### Step 3: Parse both streams into a unified timeline
+### Step 3: Align memo + transcript
 
-Build a list of timed events from both sources:
-
-**From the memo** — each line becomes:
-```
-{ type: "memo", time_s: <seconds from session start>, text: "...", edited_at: <optional> }
-```
-
-Parse timestamps using the `[MM:SS]` or `[HH:MM:SS]` format. Lines with `~` have an edit timestamp indicating the note was revised.
-
-**From the transcript JSON** — each word entry becomes:
-```
-{ type: "transcript", time_s: <start_ms / 1000>, end_s: <end_ms / 1000>, channel: 0|1, text: "..." }
+Run:
+```bash
+python3 aside.py align \
+  --memo "<session-name>.md" \
+  --transcripts /tmp/<session-name>_seg0_transcript.json [seg1...] \
+  --meta ".aside/<session-name>.meta.json" \
+  --output ".aside/<session-name>_aligned.md"
 ```
 
-Channel 0 = mic (the local user), Channel 1 = system audio (the remote participant(s)).
-
-**Multi-segment alignment**: For segments beyond seg0, add `offset_ms / 1000` to all transcript timestamps from that segment to place them on the session's global timeline.
-
-### Step 4: Generate the aligned artifact
-
-Sort all events by timestamp. Write a markdown document with this structure:
-
-```markdown
-# <session-name> — Aligned Timeline
-
-**Session start**: <datetime from DB>
-**Duration**: <total duration>
-**Segments**: <count> audio segments
-
----
-
-## Timeline
-
-### 00:00–00:30
-
-> [transcript ch1] So the main question is whether we should redesign the auth layer or patch the existing one.
-
-> [transcript ch0] Yeah, I think a full redesign makes more sense given the new requirements.
-
-**[00:05 memo]** discussing API redesign
-
-### 00:30–01:30
-
-> [transcript ch1] The JWT approach would let us decouple the session store entirely...
-
-> [transcript ch0] Right, and we could use refresh tokens to handle the mobile case.
-
-### 01:30–02:30
-
-> [transcript ch0] Actually let me reconsider — what about the migration path for existing sessions?
-
-**[01:30 memo]** revisited auth approach — decided on JWT
-*[edited at 02:15]*
-
-### 05:00–05:30
-
-> [transcript ch0] Okay so I'll draft an RFC for the JWT migration by end of week.
-
-> [transcript ch1] Sounds good, I'll review it Monday.
-
-**[05:00 memo]** action item: draft RFC by Friday
-
----
-
-## Memo lines without nearby transcript
-
-(Any memo lines that don't fall near transcript entries, listed here for completeness)
-
-## Session metadata
-
-- Segments: seg0 (0ms offset, 312.5s), seg1 (315000ms offset, 180.2s)
-- Memo lines: 12
-- Transcript entries: 47
-```
-
-**Formatting rules:**
-- Group into time windows (30s–60s chunks, or natural breaks in conversation)
-- Transcript lines are blockquotes with channel labels: `> [transcript ch0]` for the local user, `> [transcript ch1]` for the remote side
-- Memo lines are bold with their timestamp: `**[MM:SS memo]** text`
-- Edited memo lines get an italic annotation: `*[edited at MM:SS]*`
-- If a memo line falls within a transcript window, place it after the transcript lines it corresponds to
-- If a memo line has no nearby transcript (e.g., during silence), include it in sequence anyway
-
-Write the aligned artifact to `.aside/<session-name>_aligned.md`. Report to the user:
-
-> Aligned <N> memo lines with <M> transcript entries across <duration>. Output: `.aside/<session-name>_aligned.md`
+This produces the aligned timeline. In the output, `ch0` = mic (the local user), `ch1` = system audio (the remote participant). Report to the user:
+> Aligned <N> memo lines with <M> transcript entries. Output: `.aside/<session-name>_aligned.md`
 
 **If `--align-only` was passed, stop here.**
 
@@ -172,7 +97,7 @@ Write the aligned artifact to `.aside/<session-name>_aligned.md`. Report to the 
 
 ## Phase II — Distillation
 
-### Step 5: Memo-guided analysis
+### Step 4: Memo-guided analysis
 
 The memo is the user's real-time attention signal — what they found important enough to write down during the conversation, not in hindsight. Use it to drive analysis priority.
 
@@ -184,13 +109,13 @@ The memo is the user's real-time attention signal — what they found important 
    - **Question** — something to follow up on
    - **Observation** — neutral notation of what's being discussed
 
-2. **Edited memos (`~` timestamps) signal reconsideration.** A memo line with `[01:30 ~02:15]` means the user wrote something at 01:30 and came back to edit it at 02:15. This indicates the topic was important enough to revisit. Weight these higher.
+2. **Edited memos signal reconsideration.** A memo line followed by `*[edited at MM:SS]*` means the user came back to revise it at that later timestamp. This indicates the topic was important enough to revisit. Weight these higher.
 
 3. **Extract topics from un-noted transcript.** Scan the transcript for significant topics that the user did *not* memo. These are secondary — the user may have chosen not to note them for a reason, or they may have been too absorbed to write.
 
 4. **Build a prioritized topic list.** Memo-marked topics first (ordered by classification weight: decisions > action items > insights > tensions > questions > observations), then significant un-noted topics.
 
-### Step 6: Enzyme vault search
+### Step 5: Enzyme vault search
 
 Connect the conversation to existing vault thinking.
 
@@ -211,7 +136,7 @@ Use **two search strategies**:
 Run Grep for each concrete anchor. Prioritize anchors that appear near memo-marked topics.
 
 **Semantic search** — for themes and concepts without a concrete anchor:
-- Formulate 2-3 queries from the prioritized topic list (Step 5), using the vault's vocabulary where possible
+- Formulate 2-3 queries from the prioritized topic list (Step 4), using the vault's vocabulary where possible
 - Focus on memo-marked topics first, then significant un-noted topics
 - Queries should be substantive and specific, drawn from actual conversation content
 
@@ -235,13 +160,13 @@ After both structured and semantic results come back:
 - Note **people links** (`[[Person Name]]`) that appear
 - Note **connections** between the transcript content and vault content — these become citations in the draft
 
-### Step 7: Template + draft
+### Step 6: Template + draft
 
 1. **Load template** `1on1-idea-exchange` from `$OBSIDIAN_VAULT/.claude/commands/transcript/templates/`.
 
 2. **Generate draft** following these principles:
 
-   **Topic ordering**: Use the memo-weighted priority from Step 5. Decisions and action items surface first, then insights and tensions, then un-noted topics. This reflects what the user actually cared about during the conversation.
+   **Topic ordering**: Use the memo-weighted priority from Step 4. Decisions and action items surface first, then insights and tensions, then un-noted topics. This reflects what the user actually cared about during the conversation.
 
    **Content principles:**
    - Preserve specific language and direct quotes — use their actual words
@@ -264,7 +189,7 @@ After both structured and semantic results come back:
    - Use block embeds `![[file#^block-id]]` only when the source has explicit block IDs and the quote is concise and directly relevant
    - Don't force connections — only cite where the link genuinely enriches the note
 
-### Step 8: Review
+### Step 7: Review
 
 Present the complete draft to the user. Ask:
 - Does the structure capture what mattered in this conversation?
@@ -273,7 +198,7 @@ Present the complete draft to the user. Ask:
 
 Apply revisions if requested. Iterate until the user is satisfied.
 
-### Step 9: Write to vault
+### Step 8: Write to vault
 
 Once approved:
 

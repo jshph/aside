@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Transcribe a stereo WAV file into Hyprnote transcript.json format.
+"""Aside audio processing toolkit.
 
-Splits stereo audio into per-channel mono files, transcribes each with
-whisper-cli (whisper.cpp), then runs multi-pass cleanup to remove
-hallucinations, deduplicate words, strip backchannels/fillers, and merge
-overlapping speech into clean turn-taking entries.
+Subcommands:
+    transcribe  Transcribe stereo WAV into Hyprnote transcript.json format.
+    align       Align memo + transcript into timeline markdown.
 
 Usage:
-    python3 aside.py <wav_path> [--output <path>] [--keep-backchannels] [--model <path>]
+    python3 aside.py transcribe <wav_path> [--output <path>] [--keep-backchannels] [--model <path>]
+    python3 aside.py align --memo <path> --transcripts <path>... --meta <path> --output <path>
 
 Stdout protocol (machine-parseable lines):
     SPLITTING_CHANNELS          splitting stereo into mono
     TRANSCRIBING:0 / :1        transcribing each channel
     CLEANUP:raw_words=N         raw word count before cleanup
     CLEANUP:final_entries=N     entry count after cleanup
-    OUTPUT_FILE:<path>          where transcript.json was written
+    OUTPUT_FILE:<path>          where output was written
     SESSION_ID:<id>             detected session ID
     DURATION:<seconds>          audio duration in seconds
+    ALIGNED:memos=N,...         alignment summary
     ERROR:<message>             on failure
 """
 
@@ -530,22 +531,218 @@ def resolve_paths(input_path: str, output_flag: str | None) -> tuple[str, str, s
 
 
 # ---------------------------------------------------------------------------
+# Alignment: memo + transcript → timeline
+# ---------------------------------------------------------------------------
+
+MEMO_LINE_RE = re.compile(
+    r'^\[(?:(\d+):)?(\d+):(\d+)'
+    r'(?:\s*~\s*(?:(\d+):)?(\d+):(\d+))?'
+    r'\]\s*(.*)',
+)
+
+
+def _parse_ts(h: str | None, m: str, s: str) -> int:
+    """Convert optional-hours, minutes, seconds strings to total seconds."""
+    return (int(h) * 3600 if h else 0) + int(m) * 60 + int(s)
+
+
+def _fmt_ts(seconds: float) -> str:
+    """Format seconds as MM:SS or HH:MM:SS."""
+    t = int(seconds)
+    if t >= 3600:
+        return f"{t // 3600}:{(t % 3600) // 60:02d}:{t % 60:02d}"
+    return f"{t // 60:02d}:{t % 60:02d}"
+
+
+def parse_memo(path: str) -> list[dict]:
+    """Parse memo file with [MM:SS] / [HH:MM:SS] / [MM:SS ~MM:SS] timestamps.
+
+    Returns list of {time_s, edited_at_s, text} dicts.
+    """
+    entries = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = MEMO_LINE_RE.match(line)
+            if not m:
+                continue
+            time_s = _parse_ts(m.group(1), m.group(2), m.group(3))
+            edited_at_s = None
+            if m.group(5) is not None:
+                edited_at_s = _parse_ts(m.group(4), m.group(5), m.group(6))
+            entries.append({
+                'time_s': time_s,
+                'edited_at_s': edited_at_s,
+                'text': m.group(7).strip(),
+            })
+    return entries
+
+
+def parse_transcripts(paths: list[str], meta: dict) -> list[dict]:
+    """Read transcript JSONs, apply segment offsets from meta.
+
+    Returns list of {time_s, end_s, channel, text} dicts.
+    """
+    offsets = {s['segment_index']: s.get('offset_ms', 0)
+               for s in meta.get('segments', [])}
+    entries = []
+    for i, path in enumerate(paths):
+        offset_ms = offsets.get(i, 0)
+        with open(path) as f:
+            data = json.load(f)
+        for word in data.get('transcripts', [{}])[0].get('words', []):
+            entries.append({
+                'time_s': (word['start_ms'] + offset_ms) / 1000.0,
+                'end_s': (word['end_ms'] + offset_ms) / 1000.0,
+                'channel': word['channel'],
+                'text': word['text'].strip(),
+            })
+    return entries
+
+
+def build_timeline(memos: list[dict], transcripts: list[dict]) -> list[dict]:
+    """Merge memo and transcript events, sort by timestamp."""
+    events = []
+    for m in memos:
+        events.append({
+            'type': 'memo',
+            'time_s': m['time_s'],
+            'end_s': m['time_s'],
+            'edited_at_s': m.get('edited_at_s'),
+            'text': m['text'],
+        })
+    for t in transcripts:
+        events.append({
+            'type': 'transcript',
+            'time_s': t['time_s'],
+            'end_s': t['end_s'],
+            'channel': t['channel'],
+            'text': t['text'],
+        })
+    # Memos sort after transcript entries at the same timestamp
+    events.sort(key=lambda e: (e['time_s'], e['type'] == 'memo'))
+    return events
+
+
+def group_into_windows(events: list[dict], max_gap_s: int = 60) -> list[dict]:
+    """Group events into time windows.
+
+    Memo timestamps create window boundaries. Gaps >max_gap_s without memos
+    get subdivided.
+
+    Returns list of {start_s, end_s, events} dicts.
+    """
+    if not events:
+        return []
+
+    session_end = max(e['end_s'] for e in events)
+    memo_times = sorted(set(e['time_s'] for e in events if e['type'] == 'memo'))
+
+    # Boundaries: session start + memo times + session end
+    boundaries = sorted(set([0.0] + memo_times + [session_end]))
+
+    # Subdivide gaps longer than max_gap_s
+    refined = [boundaries[0]]
+    for i in range(1, len(boundaries)):
+        gap = boundaries[i] - refined[-1]
+        if gap > max_gap_s:
+            n = max(1, round(gap / max_gap_s))
+            step = gap / n
+            for j in range(1, n):
+                refined.append(round(refined[-1] + step, 1))
+        refined.append(boundaries[i])
+    refined = sorted(set(refined))
+
+    # Assign events to windows [start, next_boundary)
+    windows = []
+    for i in range(len(refined) - 1):
+        w_start, w_end = refined[i], refined[i + 1]
+        w_events = [e for e in events if w_start <= e['time_s'] < w_end]
+        if w_events:
+            windows.append({
+                'start_s': w_start,
+                'end_s': w_end,
+                'events': w_events,
+            })
+
+    # Events at exactly session_end go into last window
+    tail = [e for e in events if e['time_s'] >= refined[-1]]
+    if tail:
+        if windows:
+            windows[-1]['events'].extend(tail)
+        else:
+            windows.append({
+                'start_s': refined[-1],
+                'end_s': session_end,
+                'events': tail,
+            })
+
+    return windows
+
+
+def format_aligned_markdown(
+    windows: list[dict], session_name: str, meta: dict,
+) -> tuple[str, int, int, int]:
+    """Render aligned timeline as markdown.
+
+    Returns (text, memo_count, transcript_count, window_count).
+    """
+    lines = [f"# {session_name} — Aligned Timeline", ""]
+
+    start_time = meta.get('start_time', '')
+    if start_time:
+        lines.append(f"**Session start**: {start_time}")
+
+    segments = meta.get('segments', [])
+    total_duration = sum(s.get('duration_secs', 0) for s in segments)
+    if total_duration:
+        m, s = divmod(int(total_duration), 60)
+        lines.append(f"**Duration**: {m}m {s}s")
+
+    seg_count = len(segments)
+    lines.append(f"**Segments**: {seg_count} audio segment{'s' if seg_count != 1 else ''}")
+    lines.extend(["", "---", "", "## Timeline", ""])
+
+    memo_count = 0
+    transcript_count = 0
+
+    for w in windows:
+        lines.append(f"### {_fmt_ts(w['start_s'])}–{_fmt_ts(w['end_s'])}")
+        lines.append("")
+        for e in w['events']:
+            if e['type'] == 'transcript':
+                transcript_count += 1
+                lines.append(f"> [transcript ch{e['channel']}] {e['text']}")
+                lines.append("")
+            elif e['type'] == 'memo':
+                memo_count += 1
+                lines.append(f"**[{_fmt_ts(e['time_s'])} memo]** {e['text']}")
+                if e.get('edited_at_s') is not None:
+                    lines.append(f"*[edited at {_fmt_ts(e['edited_at_s'])}]*")
+                lines.append("")
+
+    lines.extend(["---", "", "## Session metadata", ""])
+    for seg in segments:
+        idx = seg['segment_index']
+        offset = seg.get('offset_ms', 0)
+        dur = seg.get('duration_secs', 0)
+        lines.append(f"- seg{idx} ({offset}ms offset, {dur:.1f}s)")
+    lines.append(f"- Memo lines: {memo_count}")
+    lines.append(f"- Transcript entries: {transcript_count}")
+    lines.append("")
+
+    return "\n".join(lines), memo_count, transcript_count, len(windows)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Transcribe stereo WAV into Hyprnote transcript.json format.",
-    )
-    parser.add_argument("input", help="Path to stereo .wav file or Hyprnote session directory")
-    parser.add_argument("--output", "-o", help="Output path (default: auto-detect)")
-    parser.add_argument("--keep-backchannels", action="store_true",
-                        help="Skip backchannel/filler removal passes")
-    parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help=f"Whisper model repo (default: {DEFAULT_MODEL})")
-    args = parser.parse_args()
-
+def cmd_transcribe(args):
+    """Execute the transcribe subcommand."""
     try:
         wav_path, out_path, session_id = resolve_paths(args.input, args.output)
     except FileNotFoundError as e:
@@ -555,14 +752,12 @@ def main():
     if session_id:
         print(f"SESSION_ID:{session_id}")
 
-    # Duration
     try:
         duration = get_duration(wav_path)
         print(f"DURATION:{duration:.1f}")
     except Exception:
         duration = None
 
-    # Split channels
     print("SPLITTING_CHANNELS")
     try:
         ch0_path, ch1_path = split_stereo(wav_path)
@@ -570,7 +765,6 @@ def main():
         print(f"ERROR:ffmpeg failed: {e.stderr.decode() if e.stderr else e}")
         sys.exit(1)
 
-    # Transcribe
     try:
         print("TRANSCRIBING:0")
         ch0_words = transcribe_channel(ch0_path, 0, args.model)
@@ -589,16 +783,92 @@ def main():
     all_words = ch0_words + ch1_words
     print(f"CLEANUP:raw_words={len(all_words)}")
 
-    # Cleanup
     entries = cleanup(all_words, keep_backchannels=args.keep_backchannels)
     print(f"CLEANUP:final_entries={len(entries)}")
 
-    # Format and write
     transcript = format_hyprnote(entries, session_id)
     with open(out_path, "w") as f:
         json.dump(transcript, f, indent=2)
 
     print(f"OUTPUT_FILE:{out_path}")
+
+
+def cmd_align(args):
+    """Execute the align subcommand."""
+    try:
+        memos = parse_memo(args.memo)
+    except FileNotFoundError:
+        print(f"ERROR:Memo file not found: {args.memo}")
+        sys.exit(1)
+
+    try:
+        with open(args.meta) as f:
+            meta = json.load(f)
+    except FileNotFoundError:
+        print(f"ERROR:Meta file not found: {args.meta}")
+        sys.exit(1)
+
+    try:
+        transcripts = parse_transcripts(args.transcripts, meta)
+    except FileNotFoundError as e:
+        print(f"ERROR:Transcript file not found: {e}")
+        sys.exit(1)
+
+    timeline = build_timeline(memos, transcripts)
+    windows = group_into_windows(timeline)
+
+    session_name = meta.get('name', os.path.splitext(os.path.basename(args.memo))[0])
+    md, memo_count, transcript_count, window_count = format_aligned_markdown(
+        windows, session_name, meta,
+    )
+
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(args.output, "w") as f:
+        f.write(md)
+
+    print(f"ALIGNED:memos={memo_count},transcripts={transcript_count},windows={window_count}")
+    print(f"OUTPUT_FILE:{args.output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Aside audio processing toolkit.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # transcribe subcommand
+    p_transcribe = subparsers.add_parser(
+        "transcribe",
+        help="Transcribe stereo WAV into Hyprnote transcript.json format.",
+    )
+    p_transcribe.add_argument("input", help="Path to stereo .wav file or Hyprnote session directory")
+    p_transcribe.add_argument("--output", "-o", help="Output path (default: auto-detect)")
+    p_transcribe.add_argument("--keep-backchannels", action="store_true",
+                              help="Skip backchannel/filler removal passes")
+    p_transcribe.add_argument("--model", default=DEFAULT_MODEL,
+                              help=f"Whisper model repo (default: {DEFAULT_MODEL})")
+
+    # align subcommand
+    p_align = subparsers.add_parser(
+        "align",
+        help="Align memo + transcript into timeline markdown.",
+    )
+    p_align.add_argument("--memo", required=True, help="Path to memo .md file")
+    p_align.add_argument("--transcripts", required=True, nargs="+",
+                         help="Path(s) to transcript JSON files")
+    p_align.add_argument("--meta", required=True, help="Path to session .meta.json")
+    p_align.add_argument("--output", required=True,
+                         help="Output path for aligned markdown")
+
+    args = parser.parse_args()
+
+    if args.command == "transcribe":
+        cmd_transcribe(args)
+    elif args.command == "align":
+        cmd_align(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

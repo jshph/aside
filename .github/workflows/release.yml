@@ -47,13 +47,12 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           SHA256=$(cut -d ' ' -f1 "$ARCHIVE.sha256")
-          TAR_URL="https://github.com/jshph/aside/archive/refs/tags/v${VERSION}.tar.gz"
-          SOURCE_SHA256=$(curl -sL "$TAR_URL" | shasum -a 256 | cut -d ' ' -f1)
+          BINARY_URL="https://github.com/jshph/aside/releases/download/v${VERSION}/aside-${VERSION}-aarch64-apple-darwin.tar.gz"
 
           git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/jshph/homebrew-aside.git _tap
           cd _tap
-          sed -i '' "s|url \".*\"|url \"${TAR_URL}\"|" Formula/aside.rb
-          sed -i '' "s|sha256 \".*\"|sha256 \"${SOURCE_SHA256}\"|" Formula/aside.rb
+          sed -i '' "s|url \".*\"|url \"${BINARY_URL}\"|" Formula/aside.rb
+          sed -i '' "s|sha256 \".*\"|sha256 \"${SHA256}\"|" Formula/aside.rb
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/aside.rb

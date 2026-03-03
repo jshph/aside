@@ -18,7 +18,7 @@ Born from two years of the same Obsidian workflow: record, take sparse notes, tr
 
 **Your vault is the context window.** Every meeting app can transcribe. None of them know what you've been thinking about for the past two years. Aside's skill searches your vault during distillation — grepping for concrete anchors, running semantic search against your own writing — and weaves those connections into the final note. The meeting doesn't exist in isolation; it lands in the middle of your existing work.
 
-**AI-native where it matters.** The intelligence isn't compiled into the app. The distillation step is a Claude Code skill — a plain markdown file ([`SKILL.md`](SKILL.md)) that teaches Claude how to use your vault as context. You can read it, edit it, swap the template. The skill orchestrates [Enzyme](https://enzyme.garden) search, transcript analysis, and note generation in natural language. No black-box features, no plugin system to learn.
+**AI-native where it matters.** The intelligence isn't compiled into the app. The distillation step is a Claude Code skill — a plain markdown file ([`SKILL.md`](skills/aside/SKILL.md)) that teaches Claude how to use your vault as context. You can read it, edit it, swap the template. The skill orchestrates [Enzyme](https://enzyme.garden) search, transcript analysis, and note generation in natural language. No black-box features, no plugin system to learn.
 
 **5 MB binary, ~3,100 lines of code.** A Rust binary for capture, a Python script for transcription cleanup, and a markdown skill file for distillation. Small enough to read the entire codebase in an afternoon, fork it, and make it yours.
 
@@ -35,7 +35,7 @@ Born from two years of the same Obsidian workflow: record, take sparse notes, tr
 
 ```bash
 # The recorder
-cargo install --path .
+brew install jshph/aside/aside
 
 # The transcriber
 brew install whisper-cpp ffmpeg
@@ -45,7 +45,20 @@ hf download ggerganov/whisper.cpp ggml-large-v3-turbo.bin \
   --local-dir ~/.local/share/whisper-cpp/
 ```
 
+Or build from source: `cargo install --path .`
+
 macOS only. Requires screen recording permission for system audio capture.
+
+### Install the Claude Code skill
+
+The `/aside` skill handles transcription, alignment, and distillation. This repo is a Claude Code [plugin](https://docs.anthropic.com/en/docs/claude-code/plugins) — install it from Claude Code:
+
+```
+/plugin marketplace add jshph/aside
+/plugin install aside
+```
+
+Then `/aside <session-name>` is available in any Claude Code session.
 
 ## Usage
 
@@ -75,7 +88,7 @@ Use the `/aside` Claude Code skill for the full pipeline:
 Or run transcription standalone:
 
 ```bash
-python3 aside.py transcribe .aside/standup_seg0.wav --output .aside/
+python3 scripts/aside.py transcribe .aside/standup_seg0.wav --output .aside/
 ```
 
 ## Vault integration
@@ -105,8 +118,9 @@ A template at `.aside/template.md` controls the note format. Variables: `{{name}
 ## Project structure
 
 ```
-aside.py            Transcription, cleanup, and alignment (875 lines)
-SKILL.md            Claude Code skill — the distillation brain (300 lines)
+scripts/aside.py    Transcription, cleanup, and alignment (875 lines)
+skills/aside/
+  SKILL.md          Claude Code skill — the distillation brain (300 lines)
 src/
   main.rs           CLI and session orchestration
   recorder.rs       Stereo audio capture (mic + system)

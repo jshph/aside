@@ -1,0 +1,10 @@
+{
+  "name": "aside",
+  "description": "Meeting capture — record mic + system audio, take timestamped notes, transcribe locally, distill into vault-connected notes.",
+  "version": "0.1.1",
+  "author": {
+    "name": "Joshua Pham",
+    "repository": "https://github.com/jshph/aside"
+  },
+  "homepage": "https://github.com/jshph/aside"
+}

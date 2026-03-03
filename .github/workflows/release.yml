@@ -28,7 +28,7 @@ jobs:
           ARCHIVE="aside-${{ steps.version.outputs.version }}-aarch64-apple-darwin.tar.gz"
           tar czf "$ARCHIVE" \
             -C target/release aside \
-            -C "$GITHUB_WORKSPACE" aside.py SKILL.md install.sh LICENSE
+            -C "$GITHUB_WORKSPACE" install.sh LICENSE
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 

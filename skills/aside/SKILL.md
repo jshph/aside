@@ -70,7 +70,7 @@ If the memo file doesn't exist, ask the user for the correct session name.
 
 For each WAV segment, run:
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/aside.py transcribe ".aside/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/aside/scripts/aside.py transcribe ".aside/<session-name>_seg<N>.wav" --output "/tmp/<session-name>_seg<N>_transcript.json"
 ```
 
 This produces a JSON file with `transcripts[0].words[]`, each entry containing `start_ms`, `end_ms`, `text`, and `channel`.
@@ -81,7 +81,7 @@ When there are multiple segments (from device switches), adjust transcript times
 
 Run:
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/aside.py align \
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/aside/scripts/aside.py align \
   --memo "<session-name>.md" \
   --transcripts /tmp/<session-name>_seg0_transcript.json [seg1...] \
   --meta ".aside/<session-name>.meta.json" \

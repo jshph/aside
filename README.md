@@ -88,7 +88,7 @@ Use the `/aside` Claude Code skill for the full pipeline:
 Or run transcription standalone:
 
 ```bash
-python3 scripts/aside.py transcribe .aside/standup_seg0.wav --output .aside/
+python3 skills/aside/scripts/aside.py transcribe .aside/standup_seg0.wav --output .aside/
 ```
 
 ## Vault integration
@@ -118,9 +118,9 @@ A template at `.aside/template.md` controls the note format. Variables: `{{name}
 ## Project structure
 
 ```
-scripts/aside.py    Transcription, cleanup, and alignment (875 lines)
 skills/aside/
   SKILL.md          Claude Code skill — the distillation brain (300 lines)
+  scripts/aside.py  Transcription, cleanup, and alignment (875 lines)
 src/
   main.rs           CLI and session orchestration
   recorder.rs       Stereo audio capture (mic + system)

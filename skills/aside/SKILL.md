@@ -162,7 +162,12 @@ After both structured and semantic results come back:
 
 ### Step 6: Template + draft
 
-1. **Load template** `1on1-idea-exchange` from `$OBSIDIAN_VAULT/.claude/commands/transcript/templates/`.
+1. **Select and load template** from `$CLAUDE_PLUGIN_ROOT/skills/aside/templates/`:
+   - `1on1-idea-exchange.md` — default for most 1:1 conversations (idea exchange, catch-ups, brainstorms)
+   - `discovery-call.md` — client/prospect conversations focused on needs, fit, and next steps
+   - `group-conversation.md` — 3+ participants where tracking who thinks what matters
+
+   Choose based on the memo and transcript content. If unclear, default to `1on1-idea-exchange`.
 
 2. **Generate draft** following these principles:
 

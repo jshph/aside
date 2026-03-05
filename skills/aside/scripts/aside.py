@@ -3,15 +3,22 @@
 
 Subcommands:
     transcribe  Transcribe stereo WAV into Hyprnote transcript.json format.
+    diarize     Diarize + transcribe mono/mixed audio (in-person, phone, voice memo).
     align       Align memo + transcript into timeline markdown.
 
 Usage:
     python3 aside.py transcribe <wav_path> [--output <path>] [--keep-backchannels] [--model <path>]
+    python3 aside.py diarize <audio_file> [--output <path>] [--num-speakers N] [--chunk-secs N] [--keep-backchannels] [--model <path>]
     python3 aside.py align --memo <path> --transcripts <path>... --meta <path> --output <path>
 
 Stdout protocol (machine-parseable lines):
     SPLITTING_CHANNELS          splitting stereo into mono
     TRANSCRIBING:0 / :1        transcribing each channel
+    CONVERTING                  converting to 16kHz mono WAV
+    DIARIZING:chunk=N,offset=M  diarizing chunk N
+    DIARIZE:segments=N,speakers=M  diarization complete
+    TRANSCRIBING                whisper transcription (full file)
+    MERGE:words=N,filtered=M   merge results
     CLEANUP:raw_words=N         raw word count before cleanup
     CLEANUP:final_entries=N     entry count after cleanup
     OUTPUT_FILE:<path>          where output was written
@@ -70,6 +77,80 @@ LEADING_BACKCHANNEL_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
+def convert_to_wav_16k(input_path: str) -> tuple[str, bool]:
+    """Convert audio to 16kHz mono PCM WAV if needed.
+
+    Returns (wav_path, is_temp) — is_temp is True if a temp file was created.
+    """
+    input_path = os.path.expanduser(input_path)
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"File not found: {input_path}")
+
+    # Probe format
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=sample_rate,channels,codec_name",
+                "-of", "json",
+                input_path,
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        info = json.loads(probe.stdout)
+        stream = info.get("streams", [{}])[0]
+        rate = int(stream.get("sample_rate", 0))
+        channels = int(stream.get("channels", 0))
+        codec = stream.get("codec_name", "")
+    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
+        rate, channels, codec = 0, 0, ""
+
+    if rate == 16000 and channels == 1 and codec == "pcm_s16le":
+        return input_path, False
+
+    wav_path = tempfile.mktemp(suffix="_16k.wav")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le",
+            wav_path,
+        ],
+        check=True, capture_output=True,
+    )
+    return wav_path, True
+
+
+def chunk_audio(wav_path: str, chunk_secs: int = 1800) -> list[tuple[str, float]]:
+    """Split audio into chunks via ffmpeg.
+
+    Returns [(chunk_path, offset_secs)]. Skips chunking if file is shorter
+    than chunk_secs * 1.2.
+    """
+    duration = get_duration(wav_path)
+    if duration < chunk_secs * 1.2:
+        return [(wav_path, 0.0)]
+
+    chunks = []
+    offset = 0.0
+    idx = 0
+    while offset < duration:
+        chunk_path = tempfile.mktemp(suffix=f"_chunk{idx}.wav")
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", wav_path,
+                "-ss", str(offset), "-t", str(chunk_secs),
+                "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le",
+                chunk_path,
+            ],
+            check=True, capture_output=True,
+        )
+        chunks.append((chunk_path, offset))
+        offset += chunk_secs
+        idx += 1
+    return chunks
+
+
 def get_duration(path: str) -> float:
     """Return audio duration in seconds via ffprobe."""
     result = subprocess.run(
@@ -125,10 +206,12 @@ def _resolve_model_path(model: str) -> str:
     sys.exit(1)
 
 
-def transcribe_channel(audio_path: str, channel: int, model: str) -> list[dict]:
-    """Transcribe a mono WAV via whisper-cli and return word dicts."""
-    model_path = _resolve_model_path(model)
+def _run_whisper(wav_path: str, model_path: str,
+                 offset_ms: int = 0) -> list[dict]:
+    """Run whisper-cli on a WAV and return parsed tokens.
 
+    Each token dict has start_ms, end_ms, text (with offset applied).
+    """
     out_prefix = tempfile.mktemp(suffix="_whisper")
 
     try:
@@ -136,7 +219,7 @@ def transcribe_channel(audio_path: str, channel: int, model: str) -> list[dict]:
             [
                 "whisper-cli",
                 "-m", model_path,
-                "-f", audio_path,
+                "-f", wav_path,
                 "-l", "en",
                 "-ojf",
                 "-of", out_prefix,
@@ -165,12 +248,288 @@ def transcribe_channel(audio_path: str, channel: int, model: str) -> list[dict]:
                 continue
             offsets = tok.get("offsets", {})
             words.append({
-                "channel": channel,
-                "start_ms": offsets.get("from", 0),
-                "end_ms": offsets.get("to", 0),
-                "id": str(uuid.uuid4()),
+                "start_ms": offsets.get("from", 0) + offset_ms,
+                "end_ms": offsets.get("to", 0) + offset_ms,
                 "text": text,
             })
+    return words
+
+
+def transcribe_channel(audio_path: str, channel: int, model: str) -> list[dict]:
+    """Transcribe a mono WAV via whisper-cli and return word dicts."""
+    model_path = _resolve_model_path(model)
+    words = _run_whisper(audio_path, model_path)
+    for w in words:
+        w["channel"] = channel
+        w["id"] = str(uuid.uuid4())
+    return words
+
+
+# ---------------------------------------------------------------------------
+# Diarization helpers (imports deferred to avoid cost for transcribe/align)
+# ---------------------------------------------------------------------------
+
+
+def _compute_centroids(embeddings, labels):
+    """Mean embedding per speaker label.
+
+    Args:
+        embeddings: (N, D) numpy array of speaker embeddings.
+        labels: (N,) numpy array of integer cluster labels.
+
+    Returns:
+        dict mapping label -> centroid vector (1-D numpy array).
+    """
+    import numpy as np
+
+    centroids = {}
+    for label in set(labels):
+        mask = labels == label
+        centroids[label] = np.mean(embeddings[mask], axis=0)
+    return centroids
+
+
+def _match_centroids(anchor, chunk):
+    """Greedy max-cosine-similarity matching of chunk centroids to anchor.
+
+    Args:
+        anchor: dict {label: centroid_vector} from chunk 0.
+        chunk: dict {label: centroid_vector} from current chunk.
+
+    Returns:
+        dict mapping chunk_label -> anchor_label.
+    """
+    from sklearn.metrics.pairwise import cosine_similarity
+    import numpy as np
+
+    anchor_labels = list(anchor.keys())
+    chunk_labels = list(chunk.keys())
+
+    anchor_matrix = np.array([anchor[l] for l in anchor_labels])
+    chunk_matrix = np.array([chunk[l] for l in chunk_labels])
+
+    sim = cosine_similarity(chunk_matrix, anchor_matrix)  # (C, A)
+
+    mapping = {}
+    used_anchor = set()
+    # Greedy: pick highest similarity pair, remove both, repeat
+    for _ in range(min(len(chunk_labels), len(anchor_labels))):
+        best_val = -2.0
+        best_ci, best_ai = 0, 0
+        for ci in range(len(chunk_labels)):
+            if chunk_labels[ci] in mapping:
+                continue
+            for ai in range(len(anchor_labels)):
+                if anchor_labels[ai] in used_anchor:
+                    continue
+                if sim[ci, ai] > best_val:
+                    best_val = sim[ci, ai]
+                    best_ci, best_ai = ci, ai
+        mapping[chunk_labels[best_ci]] = anchor_labels[best_ai]
+        used_anchor.add(anchor_labels[best_ai])
+
+    # Any unmatched chunk labels get mapped to themselves
+    for cl in chunk_labels:
+        if cl not in mapping:
+            mapping[cl] = cl
+    return mapping
+
+
+def diarize_chunked(wav_path: str, num_speakers: int = 2,
+                    chunk_secs: int = 1800) -> tuple[list, list]:
+    """Diarize audio with cross-chunk speaker consistency.
+
+    Args:
+        wav_path: Path to 16kHz mono WAV.
+        num_speakers: Expected speaker count (0 for auto).
+        chunk_secs: Chunk duration in seconds.
+
+    Returns:
+        (diar_segments, vad_segments) where diar_segments are
+        diarize.Segment objects and vad_segments are SpeechSegment objects.
+    """
+    from diarize import (
+        Segment, SpeechSegment,
+        run_vad, extract_embeddings, cluster_speakers,
+        _build_diarization_segments, diarize as diarize_full,
+    )
+    import numpy as np
+
+    chunks = chunk_audio(wav_path, chunk_secs)
+    owns_chunks = len(chunks) > 1
+
+    all_diar_segments = []
+    all_vad_segments = []
+    anchor_centroids = None
+
+    ns = num_speakers if num_speakers > 0 else None
+
+    try:
+        for i, (chunk_path, offset) in enumerate(chunks):
+            print(f"DIARIZING:chunk={i},offset={offset:.0f}", flush=True)
+
+            if i == 0 and not owns_chunks:
+                # Single file — use the high-level API directly
+                result = diarize_full(chunk_path, num_speakers=ns)
+                all_diar_segments.extend(result.segments)
+                vad = run_vad(chunk_path)
+                all_vad_segments.extend(vad)
+                continue
+
+            # Multi-chunk path: manual pipeline
+            vad = run_vad(chunk_path)
+            offset_vad = [
+                SpeechSegment(start=seg.start + offset, end=seg.end + offset)
+                for seg in vad
+            ]
+            all_vad_segments.extend(offset_vad)
+
+            if not vad:
+                continue
+
+            embeddings, subsegments = extract_embeddings(chunk_path, vad)
+            if len(embeddings) == 0:
+                continue
+
+            labels, _ = cluster_speakers(embeddings, num_speakers=ns)
+
+            if i == 0:
+                anchor_centroids = _compute_centroids(embeddings, labels)
+            elif anchor_centroids is not None:
+                chunk_centroids = _compute_centroids(embeddings, labels)
+                label_map = _match_centroids(anchor_centroids, chunk_centroids)
+                labels = np.array([label_map.get(l, l) for l in labels])
+
+            segments = _build_diarization_segments(vad, subsegments, labels)
+            for seg in segments:
+                all_diar_segments.append(Segment(
+                    start=seg.start + offset,
+                    end=seg.end + offset,
+                    speaker=seg.speaker,
+                ))
+    finally:
+        _cleanup_chunks(chunks, owns_chunks)
+
+    speakers = set(s.speaker for s in all_diar_segments)
+    print(f"DIARIZE:segments={len(all_diar_segments)},speakers={len(speakers)}", flush=True)
+
+    return all_diar_segments, all_vad_segments
+
+
+def _cleanup_chunks(chunks: list[tuple[str, float]], owns_chunks: bool):
+    """Remove temp chunk files if we created them."""
+    if owns_chunks:
+        for chunk_path, _ in chunks:
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                pass
+
+
+def transcribe_full(wav_path: str, model: str,
+                    chunk_secs: int = 1800) -> list[dict]:
+    """Transcribe an audio file via whisper-cli, chunking if needed.
+
+    Returns raw whisper JSON tokens as dicts with start_ms, end_ms, text.
+    """
+    model_path = _resolve_model_path(model)
+    chunks = chunk_audio(wav_path, chunk_secs)
+    owns_chunks = len(chunks) > 1
+
+    all_words = []
+    try:
+        for i, (chunk_path, offset) in enumerate(chunks):
+            print(f"TRANSCRIBING:chunk={i},offset={offset:.0f}", flush=True)
+            offset_ms = int(offset * 1000)
+            words = _run_whisper(chunk_path, model_path, offset_ms)
+            all_words.extend(words)
+    finally:
+        _cleanup_chunks(chunks, owns_chunks)
+
+    return all_words
+
+
+def merge_diarization_with_whisper(whisper_words: list[dict],
+                                   diar_segments: list,
+                                   vad_segments: list) -> list[dict]:
+    """Assign speaker channels to whisper tokens using diarization.
+
+    Uses bisect for O(log n) lookup. Tokens outside all VAD segments are
+    dropped (catches whisper silence hallucinations).
+
+    Args:
+        whisper_words: list of {start_ms, end_ms, text} from transcribe_full.
+        diar_segments: Segment objects with start, end, speaker.
+        vad_segments: SpeechSegment objects with start, end.
+
+    Returns:
+        list of word dicts with channel, start_ms, end_ms, text, id.
+    """
+    import bisect
+
+    # Build sorted arrays for bisect
+    diar_sorted = sorted(diar_segments, key=lambda s: s.start)
+    diar_starts = [s.start for s in diar_sorted]
+
+    vad_sorted = sorted(vad_segments, key=lambda s: s.start)
+    vad_starts = [s.start for s in vad_sorted]
+
+    # Map speaker labels to channel numbers (stable ordering)
+    speaker_labels = sorted(set(s.speaker for s in diar_sorted))
+    speaker_to_channel = {spk: i for i, spk in enumerate(speaker_labels)}
+
+    words = []
+    filtered = 0
+
+    for tok in whisper_words:
+        mid_s = (tok["start_ms"] + tok["end_ms"]) / 2000.0
+
+        # VAD filter: drop tokens outside all speech segments
+        vi = bisect.bisect_right(vad_starts, mid_s) - 1
+        in_vad = False
+        for check in range(max(0, vi), min(vi + 2, len(vad_sorted))):
+            seg = vad_sorted[check]
+            if seg.start <= mid_s <= seg.end:
+                in_vad = True
+                break
+        if not in_vad:
+            filtered += 1
+            continue
+
+        # Find diarization segment via bisect
+        di = bisect.bisect_right(diar_starts, mid_s) - 1
+        speaker = None
+
+        # Check nearby segments for best match
+        best_dist = float("inf")
+        for check in range(max(0, di), min(di + 2, len(diar_sorted))):
+            seg = diar_sorted[check]
+            if seg.start <= mid_s <= seg.end:
+                speaker = seg.speaker
+                best_dist = 0
+                break
+            seg_mid = (seg.start + seg.end) / 2
+            dist = abs(mid_s - seg_mid)
+            if dist < best_dist:
+                best_dist = dist
+                speaker = seg.speaker
+
+        # Fallback: nearest segment by midpoint
+        if speaker is None and diar_sorted:
+            speaker = min(diar_sorted,
+                          key=lambda s: abs(mid_s - (s.start + s.end) / 2)).speaker
+
+        channel = speaker_to_channel.get(speaker, 0)
+
+        words.append({
+            "channel": channel,
+            "start_ms": tok["start_ms"],
+            "end_ms": tok["end_ms"],
+            "id": str(uuid.uuid4()),
+            "text": tok["text"],
+        })
+
+    print(f"MERGE:words={len(words)},filtered={filtered}", flush=True)
     return words
 
 
@@ -239,7 +598,8 @@ def _dedup_consecutive(words: list[dict]) -> list[dict]:
     Backchannel words: keep max 2 consecutive.
     Content words: keep max 1.
     """
-    for ch in (0, 1):
+    channels = sorted(set(w["channel"] for w in words))
+    for ch in channels:
         ch_indices = [i for i, w in enumerate(words) if w["channel"] == ch]
         to_remove = set()
         streak = 1
@@ -403,7 +763,8 @@ def _bridge_merge(entries: list[dict]) -> list[dict]:
         cleaned.append(e)
 
     # Bridge merge per channel
-    for ch in (0, 1):
+    channels = sorted(set(e["channel"] for e in cleaned)) if cleaned else []
+    for ch in channels:
         ch_indices = [i for i, e in enumerate(cleaned) if e["channel"] == ch]
         merge_pairs = []
         for idx in range(len(ch_indices) - 1):
@@ -793,6 +1154,98 @@ def cmd_transcribe(args):
     print(f"OUTPUT_FILE:{out_path}")
 
 
+def cmd_diarize(args):
+    """Execute the diarize subcommand."""
+    input_path = os.path.expanduser(args.input)
+    if not os.path.isfile(input_path):
+        print(f"ERROR:File not found: {input_path}")
+        sys.exit(1)
+
+    out_path = args.output
+    if not out_path:
+        out_path = os.path.splitext(input_path)[0] + "_transcript.json"
+
+    try:
+        duration = get_duration(input_path)
+        print(f"DURATION:{duration:.1f}", flush=True)
+    except Exception:
+        duration = None
+
+    # Convert to 16kHz mono WAV
+    print("CONVERTING", flush=True)
+    try:
+        wav_path, is_temp = convert_to_wav_16k(input_path)
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR:ffmpeg conversion failed: {e.stderr.decode() if e.stderr else e}")
+        sys.exit(1)
+
+    diar_tmp = tempfile.mktemp(suffix="_diar.json")
+
+    try:
+        # Run diarization in a subprocess so native model memory is fully
+        # reclaimed before whisper starts (onnxruntime + WeSpeaker hold
+        # ~1GB that gc.collect() cannot free).
+        num_speakers = args.num_speakers if args.num_speakers > 0 else 0
+        diar_script = (
+            f"import json, sys; sys.path.insert(0, {os.path.dirname(__file__)!r}); "
+            f"from aside import diarize_chunked; "
+            f"diar, vad = diarize_chunked({wav_path!r}, "
+            f"num_speakers={num_speakers}, chunk_secs={args.chunk_secs}); "
+            f"f = open({diar_tmp!r}, 'w'); "
+            f"json.dump({{'diar': [{{'start': s.start, 'end': s.end, 'speaker': s.speaker}} for s in diar], "
+            f"'vad': [{{'start': s.start, 'end': s.end}} for s in vad]}}, f); "
+            f"f.close()"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", diar_script],
+            check=True, text=True,
+        )
+
+        # Load serialized diarization results
+        with open(diar_tmp) as f:
+            diar_data = json.load(f)
+
+        # Transcribe (chunked to limit memory)
+        whisper_words = transcribe_full(wav_path, args.model,
+                                        chunk_secs=args.chunk_secs)
+
+        # Build lightweight segment objects for merge
+        from types import SimpleNamespace
+        diar_segments = [SimpleNamespace(**s) for s in diar_data["diar"]]
+        vad_segments = [SimpleNamespace(**s) for s in diar_data["vad"]]
+
+        # Merge
+        all_words = merge_diarization_with_whisper(
+            whisper_words, diar_segments, vad_segments,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR:Diarization failed (exit {e.returncode})")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR:Diarization/transcription failed: {e}")
+        sys.exit(1)
+    finally:
+        if is_temp:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+        try:
+            os.unlink(diar_tmp)
+        except OSError:
+            pass
+
+    print(f"CLEANUP:raw_words={len(all_words)}", flush=True)
+    entries = cleanup(all_words, keep_backchannels=args.keep_backchannels)
+    print(f"CLEANUP:final_entries={len(entries)}", flush=True)
+
+    transcript = format_hyprnote(entries)
+    with open(out_path, "w") as f:
+        json.dump(transcript, f, indent=2)
+
+    print(f"OUTPUT_FILE:{out_path}", flush=True)
+
+
 def cmd_align(args):
     """Execute the align subcommand."""
     try:
@@ -848,6 +1301,22 @@ def main():
     p_transcribe.add_argument("--model", default=DEFAULT_MODEL,
                               help=f"Whisper model repo (default: {DEFAULT_MODEL})")
 
+    # diarize subcommand
+    p_diarize = subparsers.add_parser(
+        "diarize",
+        help="Diarize + transcribe mono/mixed audio (in-person, phone, voice memo).",
+    )
+    p_diarize.add_argument("input", help="Path to audio file (any ffmpeg-readable format)")
+    p_diarize.add_argument("--output", "-o", help="Output path (default: <input>_transcript.json)")
+    p_diarize.add_argument("--num-speakers", type=int, default=2,
+                           help="Expected number of speakers (0 for auto, default: 2)")
+    p_diarize.add_argument("--chunk-secs", type=int, default=1800,
+                           help="Chunk duration in seconds for long files (default: 1800)")
+    p_diarize.add_argument("--keep-backchannels", action="store_true",
+                           help="Skip backchannel/filler removal passes")
+    p_diarize.add_argument("--model", default=DEFAULT_MODEL,
+                           help=f"Whisper model repo (default: {DEFAULT_MODEL})")
+
     # align subcommand
     p_align = subparsers.add_parser(
         "align",
@@ -864,6 +1333,8 @@ def main():
 
     if args.command == "transcribe":
         cmd_transcribe(args)
+    elif args.command == "diarize":
+        cmd_diarize(args)
     elif args.command == "align":
         cmd_align(args)
     else:

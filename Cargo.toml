@@ -4,6 +4,14 @@ version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[lib]
+name = "aside"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aside"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = "0.4"

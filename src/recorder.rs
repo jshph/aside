@@ -76,11 +76,11 @@ impl RecorderHandle {
 
         let mic_stop = stop_flag.clone();
         let mic_handle = std::thread::spawn(move || {
-            drain_ring_buffer(mic_consumer, &mic_stop)
+            drain_ring_buffer(mic_consumer, &mic_stop, mic_rate)
         });
         let spk_stop = stop_flag.clone();
         let spk_handle = std::thread::spawn(move || {
-            drain_ring_buffer(spk_consumer, &spk_stop)
+            drain_ring_buffer(spk_consumer, &spk_stop, spk_rate)
         });
 
         Ok(Self {
@@ -237,12 +237,21 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
 // --- Shared consumer drain ---
 
+/// Estimated max recording duration for pre-allocation (2 hours).
+/// Avoids Vec reallocations during long recordings, which can stall
+/// the drain thread long enough to overflow the ring buffer.
+const PREALLOC_DURATION_SECS: usize = 7200;
+
 /// Drain a ring buffer consumer into a Vec until the stop flag is set,
 /// then do one final drain to pick up any remaining samples.
 ///
 /// On macOS, elevates thread QoS to UserInteractive to prevent timer
 /// coalescing from stretching the drain interval and causing overflows.
-fn drain_ring_buffer(mut consumer: rtrb::Consumer<f32>, stop: &AtomicBool) -> Vec<f32> {
+fn drain_ring_buffer(
+    mut consumer: rtrb::Consumer<f32>,
+    stop: &AtomicBool,
+    sample_rate: u32,
+) -> Vec<f32> {
     // Prevent macOS from deprioritizing this thread — timer coalescing
     // can stretch a 5ms sleep to 50ms+ under power saving, which risks
     // overflowing the ring buffer.
@@ -258,7 +267,10 @@ fn drain_ring_buffer(mut consumer: rtrb::Consumer<f32>, stop: &AtomicBool) -> Ve
         }
     }
 
-    let mut buf = Vec::new();
+    // Pre-allocate to avoid reallocations during recording. At 48kHz for
+    // 2 hours this is ~345M samples (~1.4GB). The OS won't commit physical
+    // pages until they're written, so this is cheap if the recording is shorter.
+    let mut buf = Vec::with_capacity(sample_rate as usize * PREALLOC_DURATION_SECS);
     while !stop.load(Ordering::Relaxed) {
         while let Ok(sample) = consumer.pop() {
             buf.push(sample);

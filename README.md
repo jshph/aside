@@ -6,9 +6,7 @@ A meeting capture tool that lives inside your Obsidian vault. Record, take times
 
 ## Why this exists
 
-There are good meeting tools out there. [Granola](https://granola.ai) enriches your notes with transcript context. [Hyprnote](https://github.com/fastrepl/hyprnote) is a fast, open-source Tauri app with local transcription and a plugin system. Both are polished products.
-
-Aside is for people who don't want another app. If you already live in Obsidian and a terminal, aside slots into that workflow — no new window, no account, no integration to configure. It stores sessions inside your vault, transcribes locally, and uses a Claude Code skill to search your existing notes during distillation. The output is a vault note with `[[wikilinks]]`, not a document you have to move somewhere.
+For people who don't want another app. If you already live in Obsidian and a terminal, aside slots into that workflow — no new window, no account, no integration to configure. It stores sessions inside your vault, transcribes locally, and uses a Claude Code skill to search your existing notes during distillation. The output is a vault note with `[[wikilinks]]`, not a document you have to move somewhere.
 
 Born from two years of the same Obsidian workflow: record, take sparse notes, transcribe, manually stitch the two together, then hunt through old notes for connections. This automates all of it.
 

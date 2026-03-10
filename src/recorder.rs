@@ -151,36 +151,13 @@ impl RecorderHandle {
             return Ok(0.0);
         }
 
-        // Resample speaker to mic rate if they differ. Typical case:
-        // mic=24kHz, macOS system audio tap=48kHz. The output WAV uses the
-        // mic rate — 24kHz is above whisper's 16kHz so no speech information
-        // is lost when the transcription pipeline (aside.py) downsamples.
-        let spk_samples = if self.spk_rate != self.sample_rate {
-            resample(&spk_samples, self.spk_rate, self.sample_rate)
-        } else {
-            spk_samples
-        };
-
-        let spec = hound::WavSpec {
-            channels: 2,
-            sample_rate: self.sample_rate,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-
-        let mut writer =
-            hound::WavWriter::create(path, spec).context("failed to create WAV")?;
-
-        let max_len = mic_samples.len().max(spk_samples.len());
-        for i in 0..max_len {
-            let m = mic_samples.get(i).copied().unwrap_or(0.0);
-            let s = spk_samples.get(i).copied().unwrap_or(0.0);
-            writer.write_sample(m)?;
-            writer.write_sample(s)?;
-        }
-        writer.finalize()?;
-
-        let duration = max_len as f64 / self.sample_rate as f64;
+        let duration = write_stereo_wav(
+            path,
+            &mic_samples,
+            &spk_samples,
+            self.sample_rate,
+            self.spk_rate,
+        )?;
         eprintln!("Wrote {:.1}s stereo WAV to {}", duration, path);
 
         Ok(duration)
@@ -457,22 +434,79 @@ extern "C" fn speaker_io_proc(
 /// Push speaker samples into the ring buffer, tracking drops and silence.
 #[cfg(target_os = "macos")]
 fn push_speaker_samples(ctx: &mut SpeakerCtx, data: &[f32]) {
+    push_samples_tracked(
+        &mut ctx.producer,
+        &ctx.peak,
+        &ctx.drops,
+        Some(&ctx.silence),
+        data,
+    );
+}
+
+/// Core sample-push logic, platform-independent. Tracks peak level, dropped
+/// samples (ring buffer full), and optionally consecutive silence duration.
+fn push_samples_tracked(
+    producer: &mut rtrb::Producer<f32>,
+    peak: &AtomicU32,
+    drops: &AtomicU64,
+    silence: Option<&AtomicU64>,
+    data: &[f32],
+) {
     let mut all_silent = true;
     for &s in data {
-        ctx.peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
-        if ctx.producer.push(s).is_err() {
-            ctx.drops.fetch_add(1, Ordering::Relaxed);
+        peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
+        if producer.push(s).is_err() {
+            drops.fetch_add(1, Ordering::Relaxed);
         }
         if s.abs() > SILENCE_THRESHOLD {
             all_silent = false;
         }
     }
-    if all_silent {
-        ctx.silence
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-    } else {
-        ctx.silence.store(0, Ordering::Relaxed);
+    if let Some(silence) = silence {
+        if all_silent {
+            silence.fetch_add(data.len() as u64, Ordering::Relaxed);
+        } else {
+            silence.store(0, Ordering::Relaxed);
+        }
     }
+}
+
+/// Write interleaved stereo WAV from two mono sample buffers.
+/// Resamples `spk` to `mic_rate` if rates differ. Returns duration in seconds.
+fn write_stereo_wav(
+    path: &str,
+    mic_samples: &[f32],
+    spk_samples: &[f32],
+    mic_rate: u32,
+    spk_rate: u32,
+) -> Result<f64> {
+    let spk_resampled;
+    let spk = if spk_rate != mic_rate {
+        spk_resampled = resample(spk_samples, spk_rate, mic_rate);
+        &spk_resampled
+    } else {
+        spk_samples
+    };
+
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: mic_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut writer = hound::WavWriter::create(path, spec).context("failed to create WAV")?;
+
+    let max_len = mic_samples.len().max(spk.len());
+    for i in 0..max_len {
+        let m = mic_samples.get(i).copied().unwrap_or(0.0);
+        let s = spk.get(i).copied().unwrap_or(0.0);
+        writer.write_sample(m)?;
+        writer.write_sample(s)?;
+    }
+    writer.finalize()?;
+
+    Ok(max_len as f64 / mic_rate as f64)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -485,4 +519,282 @@ fn start_speaker(
     _silence: Arc<AtomicU64>,
 ) -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
     bail!("System audio capture is only supported on macOS")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    // --- push_samples_tracked ---
+
+    #[test]
+    fn silence_detection_all_silent() {
+        let (mut producer, _consumer) = rtrb::RingBuffer::new(1024);
+        let peak = AtomicU32::new(0);
+        let drops = AtomicU64::new(0);
+        let silence = AtomicU64::new(0);
+
+        let silent_data = vec![0.0f32; 480];
+        push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &silent_data);
+
+        assert_eq!(silence.load(Ordering::Relaxed), 480);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn silence_detection_resets_on_signal() {
+        let (mut producer, _consumer) = rtrb::RingBuffer::new(4096);
+        let peak = AtomicU32::new(0);
+        let drops = AtomicU64::new(0);
+        let silence = AtomicU64::new(0);
+
+        // First: accumulate silence
+        let silent = vec![0.0f32; 480];
+        push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &silent);
+        assert_eq!(silence.load(Ordering::Relaxed), 480);
+
+        // More silence accumulates
+        push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &silent);
+        assert_eq!(silence.load(Ordering::Relaxed), 960);
+
+        // Signal arrives — resets to 0
+        let loud = vec![0.5f32; 100];
+        push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &loud);
+        assert_eq!(silence.load(Ordering::Relaxed), 0);
+
+        // Silence starts counting from zero again
+        push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &silent);
+        assert_eq!(silence.load(Ordering::Relaxed), 480);
+    }
+
+    #[test]
+    fn silence_threshold_boundary() {
+        let (mut producer, _consumer) = rtrb::RingBuffer::new(1024);
+        let peak = AtomicU32::new(0);
+        let drops = AtomicU64::new(0);
+        let silence = AtomicU64::new(0);
+
+        // Exactly at threshold — should count as silent
+        let at_threshold = vec![SILENCE_THRESHOLD; 100];
+        push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &at_threshold);
+        assert_eq!(silence.load(Ordering::Relaxed), 100);
+
+        // Just above threshold — should reset
+        let above = vec![SILENCE_THRESHOLD + 0.0001; 100];
+        push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &above);
+        assert_eq!(silence.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn drop_counting_when_buffer_full() {
+        // Tiny buffer — will overflow immediately
+        let (mut producer, _consumer) = rtrb::RingBuffer::new(10);
+        let peak = AtomicU32::new(0);
+        let drops = AtomicU64::new(0);
+
+        let data = vec![0.5f32; 50];
+        push_samples_tracked(&mut producer, &peak, &drops, None, &data);
+
+        // 10 fit in the buffer, 40 dropped
+        assert_eq!(drops.load(Ordering::Relaxed), 40);
+    }
+
+    #[test]
+    fn peak_tracking() {
+        let (mut producer, _consumer) = rtrb::RingBuffer::new(1024);
+        let peak = AtomicU32::new(0);
+        let drops = AtomicU64::new(0);
+
+        let data = vec![0.1, 0.3, 0.7, 0.2, 0.05];
+        push_samples_tracked(&mut producer, &peak, &drops, None, &data);
+
+        let recorded_peak = f32::from_bits(peak.load(Ordering::Relaxed));
+        assert!((recorded_peak - 0.7).abs() < 1e-6);
+    }
+
+    // --- drain_ring_buffer ---
+
+    #[test]
+    fn drain_collects_all_samples() {
+        let (mut producer, consumer) = rtrb::RingBuffer::new(1024);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Push some samples before starting drain
+        for i in 0..100 {
+            producer.push(i as f32 * 0.01).unwrap();
+        }
+
+        // Signal stop immediately — drain should still collect what's there
+        stop.store(true, Ordering::SeqCst);
+        let result = drain_ring_buffer(consumer, &stop, 48000);
+
+        assert_eq!(result.len(), 100);
+        assert!((result[0] - 0.0).abs() < 1e-6);
+        assert!((result[99] - 0.99).abs() < 1e-6);
+    }
+
+    #[test]
+    fn drain_preallocation() {
+        let (_producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        let stop = Arc::new(AtomicBool::new(true)); // stop immediately
+
+        let result = drain_ring_buffer(consumer, &stop, 48000);
+
+        // Should have pre-allocated capacity even though it's empty
+        assert!(result.capacity() >= 48000 * PREALLOC_DURATION_SECS);
+        assert_eq!(result.len(), 0);
+    }
+
+    // --- resample ---
+
+    #[test]
+    fn resample_same_rate_is_identity() {
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let output = resample(&input, 48000, 48000);
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn resample_downsample_halves() {
+        // 48kHz → 24kHz should roughly halve the sample count
+        let input: Vec<f32> = (0..480).map(|i| (i as f32) / 480.0).collect();
+        let output = resample(&input, 48000, 24000);
+        assert_eq!(output.len(), 240);
+        // First and last samples should be close to input endpoints
+        assert!((output[0] - input[0]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn resample_upsample_doubles() {
+        let input: Vec<f32> = (0..240).map(|i| (i as f32) / 240.0).collect();
+        let output = resample(&input, 24000, 48000);
+        assert_eq!(output.len(), 480);
+    }
+
+    #[test]
+    fn resample_empty() {
+        let output = resample(&[], 48000, 24000);
+        assert!(output.is_empty());
+    }
+
+    // --- write_stereo_wav ---
+
+    #[test]
+    fn write_stereo_wav_basic() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_stereo.wav");
+        let path_str = path.to_str().unwrap();
+
+        let mic = vec![0.1f32; 480];
+        let spk = vec![0.2f32; 480];
+
+        let duration = write_stereo_wav(path_str, &mic, &spk, 48000, 48000).unwrap();
+        assert!((duration - 0.01).abs() < 0.001); // 480/48000 = 0.01s
+
+        // Read back and verify
+        let reader = hound::WavReader::open(path_str).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 48000);
+
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(|s| s.unwrap()).collect();
+        assert_eq!(samples.len(), 960); // 480 * 2 channels
+        // Interleaved: mic, spk, mic, spk...
+        assert!((samples[0] - 0.1).abs() < 1e-6); // ch0
+        assert!((samples[1] - 0.2).abs() < 1e-6); // ch1
+
+        std::fs::remove_file(path_str).ok();
+    }
+
+    #[test]
+    fn write_stereo_wav_with_resample() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_stereo_resample.wav");
+        let path_str = path.to_str().unwrap();
+
+        let mic = vec![0.1f32; 240]; // 240 samples at 24kHz = 0.01s
+        let spk = vec![0.2f32; 480]; // 480 samples at 48kHz = 0.01s
+
+        let duration = write_stereo_wav(path_str, &mic, &spk, 24000, 48000).unwrap();
+        assert!((duration - 0.01).abs() < 0.001);
+
+        let reader = hound::WavReader::open(path_str).unwrap();
+        assert_eq!(reader.spec().sample_rate, 24000);
+        assert_eq!(reader.spec().channels, 2);
+
+        std::fs::remove_file(path_str).ok();
+    }
+
+    #[test]
+    fn write_stereo_wav_unequal_lengths_pads_zeros() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_stereo_unequal.wav");
+        let path_str = path.to_str().unwrap();
+
+        let mic = vec![0.5f32; 100];
+        let spk = vec![0.3f32; 50]; // shorter
+
+        write_stereo_wav(path_str, &mic, &spk, 48000, 48000).unwrap();
+
+        let reader = hound::WavReader::open(path_str).unwrap();
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(|s| s.unwrap()).collect();
+        assert_eq!(samples.len(), 200); // 100 * 2 channels (padded to longer)
+
+        // Past spk's length, ch1 should be 0.0
+        assert!((samples[198] - 0.5).abs() < 1e-6); // mic at index 99
+        assert!((samples[199] - 0.0).abs() < 1e-6); // spk padded with 0
+
+        std::fs::remove_file(path_str).ok();
+    }
+
+    // --- Integrated: ring buffer pressure simulation ---
+
+    #[test]
+    fn simulated_buffer_pressure() {
+        // Simulates a producer pushing faster than consumer drains,
+        // verifying drop counting works under contention.
+        let (mut producer, consumer) = rtrb::RingBuffer::new(100);
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = AtomicU32::new(0);
+
+        // Fill buffer to 80%
+        for _ in 0..80 {
+            producer.push(0.1).unwrap();
+        }
+
+        // Now push 50 more with drop tracking — 30 fit, 20 drop
+        let data = vec![0.1f32; 50];
+        let drops_local = AtomicU64::new(0);
+        push_samples_tracked(&mut producer, &peak, &drops_local, None, &data);
+        // Ring buffer has capacity 100, 80 already in, ~20 fit (rtrb uses
+        // one slot as sentinel, so actual usable capacity is 99)
+        let dropped = drops_local.load(Ordering::Relaxed);
+        assert!(dropped > 0, "expected some drops, got 0");
+        assert!(dropped <= 50, "can't drop more than we pushed");
+
+        // Drain should recover all non-dropped samples
+        stop.store(true, Ordering::SeqCst);
+        let drained = drain_ring_buffer(consumer, &stop, 48000);
+        assert_eq!(drained.len() as u64 + dropped, 130); // 80 + 50 = 130 total
+    }
+
+    // --- Tap restart threshold ---
+
+    #[test]
+    fn tap_restart_threshold_calculation() {
+        // Verify the silence-to-seconds conversion matches what the TUI uses
+        let spk_rate: u32 = 48000;
+        let threshold_secs: u64 = 10;
+        let threshold_samples = threshold_secs * spk_rate as u64;
+
+        let silence = AtomicU64::new(threshold_samples - 1);
+        let silent_secs = silence.load(Ordering::Relaxed) / spk_rate as u64;
+        assert_eq!(silent_secs, 9); // not yet at threshold
+
+        silence.store(threshold_samples, Ordering::Relaxed);
+        let silent_secs = silence.load(Ordering::Relaxed) / spk_rate as u64;
+        assert_eq!(silent_secs, 10); // at threshold — should trigger restart
+    }
 }

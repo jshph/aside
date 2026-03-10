@@ -1,10 +1,4 @@
-mod app;
-mod parser;
-mod publish;
-mod recorder;
-mod session;
-mod text_helpers;
-mod tui;
+use aside::{app, parser, publish, recorder, session, tui};
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
@@ -205,6 +199,10 @@ fn run_with_recorder(
 
         app.mic_level = recorder.mic_peak();
         app.spk_level = recorder.spk_peak();
+        app.mic_drops = recorder.mic_drops();
+        app.spk_drops = recorder.spk_drops();
+        app.spk_silence = recorder.spk_silence();
+        app.spk_rate = recorder.spk_rate();
 
         let tui_result = tui::run_tui(app, stop_flag.clone());
 
@@ -266,6 +264,23 @@ fn run_with_recorder(
                     offset_ms,
                     None,
                 )?;
+            }
+            Ok(tui::TuiAction::RestartSpeaker) => {
+                // Speaker tap died — recreate with same mic, new segment
+                eprintln!("Speaker tap silent — restarting capture");
+                segment_index = session::next_segment_index(&dir, session_name)?;
+                current_wav =
+                    format!(".aside/{}_seg{}.wav", session_name, segment_index);
+                let offset_ms = (Local::now() - app.start_time).num_milliseconds();
+                session::add_segment(
+                    &dir,
+                    session_name,
+                    segment_index,
+                    &current_wav,
+                    offset_ms,
+                    None,
+                )?;
+                // Keep current_device as-is so the same mic is used
             }
             Err(e) => return Err(anyhow::anyhow!("{}", e)),
         }

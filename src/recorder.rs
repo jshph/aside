@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SizedSample;
 use dasp::sample::ToSample;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,12 +16,17 @@ const TAP_NAME: &str = "aside-tap";
 /// dBFS RMS; this brings speech into the -30 to -20 dBFS range.
 const MIC_GAIN: f32 = 10.0;
 
-/// Pre-allocated ring buffer capacity: 2 seconds of audio at 48kHz.
-/// Gives the consumer thread plenty of slack to drain without drops.
-const RING_BUF_SECONDS: usize = 2;
+/// Pre-allocated ring buffer capacity: 10 seconds of audio at 48kHz.
+/// Gives the consumer thread plenty of slack to drain without drops,
+/// even if macOS timer coalescing stretches the drain interval.
+const RING_BUF_SECONDS: usize = 10;
 
 /// How often the consumer thread drains the ring buffer.
 const DRAIN_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Amplitude threshold below which a sample is considered silence.
+/// -60 dBFS ≈ 0.001; anything below this is indistinguishable from noise floor.
+const SILENCE_THRESHOLD: f32 = 0.001;
 
 /// Handle to a running recorder. Call `stop_and_write()` to finalize.
 pub struct RecorderHandle {
@@ -35,6 +40,11 @@ pub struct RecorderHandle {
     spk_rate: u32,
     mic_peak: Arc<AtomicU32>,
     spk_peak: Arc<AtomicU32>,
+    mic_drops: Arc<AtomicU64>,
+    spk_drops: Arc<AtomicU64>,
+    /// Consecutive silent samples on the speaker channel. Reset on any
+    /// non-silent sample. Used to detect Core Audio tap death.
+    spk_silence: Arc<AtomicU64>,
 }
 
 impl RecorderHandle {
@@ -43,9 +53,14 @@ impl RecorderHandle {
     pub fn start(stop_flag: Arc<AtomicBool>, device: Option<&cpal::Device>) -> Result<Self> {
         let mic_peak = Arc::new(AtomicU32::new(0));
         let spk_peak = Arc::new(AtomicU32::new(0));
+        let mic_drops = Arc::new(AtomicU64::new(0));
+        let spk_drops = Arc::new(AtomicU64::new(0));
+        let spk_silence = Arc::new(AtomicU64::new(0));
 
-        let (mic_stream, mic_rate, mic_consumer) = start_mic(device, mic_peak.clone())?;
-        let (spk_capture, spk_rate, spk_consumer) = start_speaker(spk_peak.clone())?;
+        let (mic_stream, mic_rate, mic_consumer) =
+            start_mic(device, mic_peak.clone(), mic_drops.clone())?;
+        let (spk_capture, spk_rate, spk_consumer) =
+            start_speaker(spk_peak.clone(), spk_drops.clone(), spk_silence.clone())?;
 
         eprintln!(
             "Recording (mic {}Hz, speaker {}Hz)...",
@@ -78,6 +93,9 @@ impl RecorderHandle {
             spk_rate,
             mic_peak,
             spk_peak,
+            mic_drops,
+            spk_drops,
+            spk_silence,
         })
     }
 
@@ -87,6 +105,24 @@ impl RecorderHandle {
 
     pub fn spk_peak(&self) -> Arc<AtomicU32> {
         self.spk_peak.clone()
+    }
+
+    pub fn mic_drops(&self) -> Arc<AtomicU64> {
+        self.mic_drops.clone()
+    }
+
+    pub fn spk_drops(&self) -> Arc<AtomicU64> {
+        self.spk_drops.clone()
+    }
+
+    /// Count of consecutive silent samples on the speaker channel.
+    /// Divide by speaker sample rate to get seconds of silence.
+    pub fn spk_silence(&self) -> Arc<AtomicU64> {
+        self.spk_silence.clone()
+    }
+
+    pub fn spk_rate(&self) -> u32 {
+        self.spk_rate
     }
 
     /// Stop recording and write WAV to `path`. Returns duration in seconds.
@@ -100,6 +136,15 @@ impl RecorderHandle {
 
         let mic_samples = self.mic_handle.join().expect("mic collector panicked");
         let spk_samples = self.spk_handle.join().expect("spk collector panicked");
+
+        let mic_dropped = self.mic_drops.load(Ordering::Relaxed);
+        let spk_dropped = self.spk_drops.load(Ordering::Relaxed);
+        if mic_dropped > 0 || spk_dropped > 0 {
+            eprintln!(
+                "Warning: dropped samples — mic: {}, speaker: {}",
+                mic_dropped, spk_dropped
+            );
+        }
 
         if mic_samples.is_empty() && spk_samples.is_empty() {
             eprintln!("No audio captured.");
@@ -194,7 +239,25 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
 /// Drain a ring buffer consumer into a Vec until the stop flag is set,
 /// then do one final drain to pick up any remaining samples.
+///
+/// On macOS, elevates thread QoS to UserInteractive to prevent timer
+/// coalescing from stretching the drain interval and causing overflows.
 fn drain_ring_buffer(mut consumer: rtrb::Consumer<f32>, stop: &AtomicBool) -> Vec<f32> {
+    // Prevent macOS from deprioritizing this thread — timer coalescing
+    // can stretch a 5ms sleep to 50ms+ under power saving, which risks
+    // overflowing the ring buffer.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::raw::c_int;
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: c_int, relative_priority: c_int) -> c_int;
+        }
+        const QOS_CLASS_USER_INTERACTIVE: c_int = 0x21;
+        unsafe {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+    }
+
     let mut buf = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         while let Ok(sample) = consumer.pop() {
@@ -215,6 +278,7 @@ fn drain_ring_buffer(mut consumer: rtrb::Consumer<f32>, stop: &AtomicBool) -> Ve
 fn start_mic(
     device: Option<&cpal::Device>,
     peak: Arc<AtomicU32>,
+    drops: Arc<AtomicU64>,
 ) -> Result<(cpal::Stream, u32, rtrb::Consumer<f32>)> {
     let host = cpal::default_host();
     let default_device;
@@ -234,9 +298,9 @@ fn start_mic(
     let (producer, consumer) = rtrb::RingBuffer::new(capacity);
 
     let stream = match format {
-        cpal::SampleFormat::F32 => build_mic_stream::<f32>(device, &config, producer, channels, peak)?,
-        cpal::SampleFormat::I16 => build_mic_stream::<i16>(device, &config, producer, channels, peak)?,
-        cpal::SampleFormat::I32 => build_mic_stream::<i32>(device, &config, producer, channels, peak)?,
+        cpal::SampleFormat::F32 => build_mic_stream::<f32>(device, &config, producer, channels, peak, drops)?,
+        cpal::SampleFormat::I16 => build_mic_stream::<i16>(device, &config, producer, channels, peak, drops)?,
+        cpal::SampleFormat::I32 => build_mic_stream::<i32>(device, &config, producer, channels, peak, drops)?,
         _ => bail!("unsupported mic format: {:?}", format),
     };
     stream.play()?;
@@ -250,6 +314,7 @@ fn build_mic_stream<S: SizedSample + ToSample<f32> + Send + 'static>(
     mut producer: rtrb::Producer<f32>,
     channels: usize,
     peak: Arc<AtomicU32>,
+    drops: Arc<AtomicU64>,
 ) -> Result<cpal::Stream> {
     Ok(device.build_input_stream(
         &config.config(),
@@ -257,7 +322,9 @@ fn build_mic_stream<S: SizedSample + ToSample<f32> + Send + 'static>(
             for sample in data.iter().step_by(channels) {
                 let s = (sample.to_sample::<f32>() * MIC_GAIN).clamp(-1.0, 1.0);
                 peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
-                let _ = producer.push(s); // lock-free; drops sample if full
+                if producer.push(s).is_err() {
+                    drops.fetch_add(1, Ordering::Relaxed);
+                }
             }
         },
         |err| eprintln!("mic error: {err}"),
@@ -279,10 +346,16 @@ struct SpeakerCtx {
     producer: rtrb::Producer<f32>,
     format: arc::R<av::AudioFormat>,
     peak: Arc<AtomicU32>,
+    drops: Arc<AtomicU64>,
+    silence: Arc<AtomicU64>,
 }
 
 #[cfg(target_os = "macos")]
-fn start_speaker(peak: Arc<AtomicU32>) -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
+fn start_speaker(
+    peak: Arc<AtomicU32>,
+    drops: Arc<AtomicU64>,
+    silence: Arc<AtomicU64>,
+) -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
     use ca::aggregate_device_keys as agg_keys;
 
     let tap_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&ns::Array::new());
@@ -315,7 +388,7 @@ fn start_speaker(peak: Arc<AtomicU32>) -> Result<(SpeakerCapture, u32, rtrb::Con
         ],
     );
 
-    let mut ctx = Box::new(SpeakerCtx { producer, format, peak });
+    let mut ctx = Box::new(SpeakerCtx { producer, format, peak, drops, silence });
 
     let agg_device = ca::AggregateDevice::with_desc(&agg_desc)
         .map_err(|e| anyhow::anyhow!("AggregateDevice::with_desc failed: {}", e))?;
@@ -351,10 +424,7 @@ extern "C" fn speaker_io_proc(
     // Try typed PCM buffer first
     if let Some(view) = av::AudioPcmBuf::with_buf_list_no_copy(&ctx.format, input_data, None) {
         if let Some(data) = view.data_f32_at(0) {
-            for &s in data {
-                ctx.peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
-                let _ = ctx.producer.push(s);
-            }
+            push_speaker_samples(ctx, data);
             return os::Status::NO_ERR;
         }
     }
@@ -365,20 +435,42 @@ extern "C" fn speaker_io_proc(
         let count = buf.data_bytes_size as usize / std::mem::size_of::<f32>();
         if count > 0 {
             let data = unsafe { std::slice::from_raw_parts(buf.data as *const f32, count) };
-            for &s in data {
-                ctx.peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
-                let _ = ctx.producer.push(s);
-            }
+            push_speaker_samples(ctx, data);
         }
     }
 
     os::Status::NO_ERR
 }
 
+/// Push speaker samples into the ring buffer, tracking drops and silence.
+#[cfg(target_os = "macos")]
+fn push_speaker_samples(ctx: &mut SpeakerCtx, data: &[f32]) {
+    let mut all_silent = true;
+    for &s in data {
+        ctx.peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
+        if ctx.producer.push(s).is_err() {
+            ctx.drops.fetch_add(1, Ordering::Relaxed);
+        }
+        if s.abs() > SILENCE_THRESHOLD {
+            all_silent = false;
+        }
+    }
+    if all_silent {
+        ctx.silence
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+    } else {
+        ctx.silence.store(0, Ordering::Relaxed);
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 struct SpeakerCapture;
 
 #[cfg(not(target_os = "macos"))]
-fn start_speaker(_peak: Arc<AtomicU32>) -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
+fn start_speaker(
+    _peak: Arc<AtomicU32>,
+    _drops: Arc<AtomicU64>,
+    _silence: Arc<AtomicU64>,
+) -> Result<(SpeakerCapture, u32, rtrb::Consumer<f32>)> {
     bail!("System audio capture is only supported on macOS")
 }

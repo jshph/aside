@@ -20,9 +20,13 @@ use std::sync::Arc;
 
 use crate::app::{App, AppMode, GUTTER_WIDTH};
 
+/// Duration of continuous speaker silence (seconds) before auto-restarting the tap.
+const TAP_RESTART_THRESHOLD_SECS: u64 = 10;
+
 pub enum TuiAction {
     Quit,
     SwitchDevice(usize),
+    RestartSpeaker,
 }
 
 /// Run the TUI event loop. Returns `TuiAction` indicating quit or device switch.
@@ -79,6 +83,19 @@ fn event_loop(
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Auto-restart speaker tap if it's been silent too long
+        if app.spk_rate > 0 {
+            let silent_samples = app.spk_silence.load(Ordering::Relaxed);
+            let silent_secs = silent_samples / app.spk_rate as u64;
+            if silent_secs >= TAP_RESTART_THRESHOLD_SECS {
+                app.message = Some(format!(
+                    "Speaker tap silent {}s — restarting capture",
+                    silent_secs
+                ));
+                return Ok(TuiAction::RestartSpeaker);
             }
         }
 
@@ -280,16 +297,32 @@ fn render(f: &mut ratatui::Frame, app: &mut App) {
 
     let mic_peak = app.mic_level.swap(0, Ordering::Relaxed);
     let spk_peak = app.spk_level.swap(0, Ordering::Relaxed);
+    let mic_drops = app.mic_drops.load(Ordering::Relaxed);
+    let spk_drops = app.spk_drops.load(Ordering::Relaxed);
+
+    // Build warning suffix for drops or silence
+    let mut warnings = String::new();
+    if mic_drops > 0 || spk_drops > 0 {
+        warnings.push_str(&format!(" DROPS mic:{} spk:{}", mic_drops, spk_drops));
+    }
+    if app.spk_rate > 0 {
+        let silent_samples = app.spk_silence.load(Ordering::Relaxed);
+        let silent_secs = silent_samples / app.spk_rate as u64;
+        if silent_secs >= 3 {
+            warnings.push_str(&format!(" SPK SILENT {}s", silent_secs));
+        }
+    }
 
     let status_text = if let Some(ref msg) = app.message {
         format!(" {} | {}", time, msg)
     } else {
         format!(
-            " {} | {} lines | mic {} spk {} | ^D device  ^S save  ^C quit",
+            " {} | {} lines | mic {} spk {} |{}  ^D device  ^S save  ^C quit",
             time,
             app.lines.len(),
             level_meter(mic_peak, 8),
             level_meter(spk_peak, 8),
+            warnings,
         )
     };
 

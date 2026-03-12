@@ -107,7 +107,7 @@ A template at `.aside/template.md` controls the note format. Variables: `{{name}
 
 **Recording**: Rust binary captures mic audio via cpal and system audio via Core Audio tap, writing 48kHz stereo WAV. Switch mic devices mid-session with `Ctrl+D` — each switch creates a new audio segment with proper timeline offsets.
 
-**Transcription**: `aside.py` splits stereo into mono channels, transcribes each with `whisper-cli`, then runs cleanup passes: hallucination removal, consecutive word dedup, backchannel/filler stripping, and gap-based phrase merging.
+**Transcription**: `aside.py` splits stereo into mono channels, transcribes both in parallel with `whisper-cli` (Metal + Flash Attention), then runs cleanup passes: hallucination removal, consecutive word dedup, backchannel/filler stripping, and gap-based phrase merging.
 
 **Alignment**: `aside.py align` interleaves transcript segments with memo lines on a shared millisecond timeline, grouping them into windows. Memo lines act as attention signals — they tell the distillation step what was worth writing down in the moment.
 

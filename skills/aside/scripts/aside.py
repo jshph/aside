@@ -224,6 +224,7 @@ def _run_whisper(wav_path: str, model_path: str,
                 "-ojf",
                 "-of", out_prefix,
                 "--max-context", "0",
+                "--flash-attn",
             ],
             check=True, capture_output=True, text=True,
         )
@@ -1127,10 +1128,13 @@ def cmd_transcribe(args):
         sys.exit(1)
 
     try:
-        print("TRANSCRIBING:0")
-        ch0_words = transcribe_channel(ch0_path, 0, args.model)
-        print("TRANSCRIBING:1")
-        ch1_words = transcribe_channel(ch1_path, 1, args.model)
+        print("TRANSCRIBING:0,1")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut0 = pool.submit(transcribe_channel, ch0_path, 0, args.model)
+            fut1 = pool.submit(transcribe_channel, ch1_path, 1, args.model)
+            ch0_words = fut0.result()
+            ch1_words = fut1.result()
     except Exception as e:
         print(f"ERROR:Transcription failed: {e}")
         sys.exit(1)
@@ -1146,6 +1150,10 @@ def cmd_transcribe(args):
 
     entries = cleanup(all_words, keep_backchannels=args.keep_backchannels)
     print(f"CLEANUP:final_entries={len(entries)}")
+
+    # Emit each entry as a JSON line for streaming to UI
+    for e in entries:
+        print(f"ENTRY:{json.dumps(e)}", flush=True)
 
     transcript = format_hyprnote(entries, session_id)
     with open(out_path, "w") as f:
@@ -1238,6 +1246,10 @@ def cmd_diarize(args):
     print(f"CLEANUP:raw_words={len(all_words)}", flush=True)
     entries = cleanup(all_words, keep_backchannels=args.keep_backchannels)
     print(f"CLEANUP:final_entries={len(entries)}", flush=True)
+
+    # Emit each entry as a JSON line for streaming to UI
+    for e in entries:
+        print(f"ENTRY:{json.dumps(e)}", flush=True)
 
     transcript = format_hyprnote(entries)
     with open(out_path, "w") as f:

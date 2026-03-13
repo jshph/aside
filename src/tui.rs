@@ -20,8 +20,10 @@ use std::sync::Arc;
 
 use crate::app::{App, AppMode, GUTTER_WIDTH};
 
-/// Duration of continuous speaker silence (seconds) before auto-restarting the tap.
-const TAP_RESTART_THRESHOLD_SECS: u64 = 10;
+/// Duration of continuous speaker dead-silence (exact zeros) before auto-restarting
+/// the tap. A live tap with nobody talking still produces noise-floor samples; a dead
+/// tap delivers pure zeros. 60s avoids false restarts during natural pauses.
+const TAP_RESTART_THRESHOLD_SECS: u64 = 60;
 
 pub enum TuiAction {
     Quit,
@@ -92,7 +94,7 @@ fn event_loop(
             let silent_secs = silent_samples / app.spk_rate as u64;
             if silent_secs >= TAP_RESTART_THRESHOLD_SECS {
                 app.message = Some(format!(
-                    "Speaker tap silent {}s — restarting capture",
+                    "Speaker tap dead {}s — restarting capture",
                     silent_secs
                 ));
                 return Ok(TuiAction::RestartSpeaker);
@@ -309,7 +311,7 @@ fn render(f: &mut ratatui::Frame, app: &mut App) {
         let silent_samples = app.spk_silence.load(Ordering::Relaxed);
         let silent_secs = silent_samples / app.spk_rate as u64;
         if silent_secs >= 3 {
-            warnings.push_str(&format!(" SPK SILENT {}s", silent_secs));
+            warnings.push_str(&format!(" TAP DEAD {}s", silent_secs));
         }
     }
 

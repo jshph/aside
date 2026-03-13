@@ -24,9 +24,10 @@ const RING_BUF_SECONDS: usize = 10;
 /// How often the consumer thread drains the ring buffer.
 const DRAIN_INTERVAL: Duration = Duration::from_millis(5);
 
-/// Amplitude threshold below which a sample is considered silence.
-/// -60 dBFS ≈ 0.001; anything below this is indistinguishable from noise floor.
-const SILENCE_THRESHOLD: f32 = 0.001;
+/// Threshold for detecting a dead Core Audio tap. A live tap with no audio still
+/// produces noise-floor samples (~0.0002); a dead tap delivers exact 0.0 values.
+/// Using a very small epsilon to account for floating-point artifacts.
+const DEAD_TAP_THRESHOLD: f32 = 1e-7;
 
 /// Handle to a running recorder. Call `stop_and_write()` to finalize.
 pub struct RecorderHandle {
@@ -444,7 +445,11 @@ fn push_speaker_samples(ctx: &mut SpeakerCtx, data: &[f32]) {
 }
 
 /// Core sample-push logic, platform-independent. Tracks peak level, dropped
-/// samples (ring buffer full), and optionally consecutive silence duration.
+/// samples (ring buffer full), and optionally consecutive dead-tap duration.
+///
+/// The silence counter detects a dead Core Audio tap by checking for exact-zero
+/// samples (below `DEAD_TAP_THRESHOLD`). A live tap with nobody talking still
+/// produces noise-floor samples that exceed this threshold.
 fn push_samples_tracked(
     producer: &mut rtrb::Producer<f32>,
     peak: &AtomicU32,
@@ -452,18 +457,18 @@ fn push_samples_tracked(
     silence: Option<&AtomicU64>,
     data: &[f32],
 ) {
-    let mut all_silent = true;
+    let mut all_dead = true;
     for &s in data {
         peak.fetch_max(s.abs().to_bits(), Ordering::Relaxed);
         if producer.push(s).is_err() {
             drops.fetch_add(1, Ordering::Relaxed);
         }
-        if s.abs() > SILENCE_THRESHOLD {
-            all_silent = false;
+        if s.abs() > DEAD_TAP_THRESHOLD {
+            all_dead = false;
         }
     }
     if let Some(silence) = silence {
-        if all_silent {
+        if all_dead {
             silence.fetch_add(data.len() as u64, Ordering::Relaxed);
         } else {
             silence.store(0, Ordering::Relaxed);
@@ -570,21 +575,34 @@ mod tests {
     }
 
     #[test]
-    fn silence_threshold_boundary() {
+    fn dead_tap_threshold_boundary() {
         let (mut producer, _consumer) = rtrb::RingBuffer::new(1024);
         let peak = AtomicU32::new(0);
         let drops = AtomicU64::new(0);
         let silence = AtomicU64::new(0);
 
-        // Exactly at threshold — should count as silent
-        let at_threshold = vec![SILENCE_THRESHOLD; 100];
+        // Exactly at dead-tap threshold — should count as dead
+        let at_threshold = vec![DEAD_TAP_THRESHOLD; 100];
         push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &at_threshold);
         assert_eq!(silence.load(Ordering::Relaxed), 100);
 
-        // Just above threshold — should reset
-        let above = vec![SILENCE_THRESHOLD + 0.0001; 100];
+        // Just above dead-tap threshold — should reset (live noise floor)
+        let above = vec![DEAD_TAP_THRESHOLD + 1e-6; 100];
         push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &above);
         assert_eq!(silence.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn noise_floor_does_not_trigger_dead_tap() {
+        let (mut producer, _consumer) = rtrb::RingBuffer::new(4096);
+        let peak = AtomicU32::new(0);
+        let drops = AtomicU64::new(0);
+        let silence = AtomicU64::new(0);
+
+        // Typical Google Meet noise floor (~0.0002) — live tap, nobody talking
+        let noise_floor = vec![0.0002f32; 480];
+        push_samples_tracked(&mut producer, &peak, &drops, Some(&silence), &noise_floor);
+        assert_eq!(silence.load(Ordering::Relaxed), 0, "noise floor should not count as dead tap");
     }
 
     #[test]
